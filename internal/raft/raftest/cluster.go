@@ -3,12 +3,14 @@ package raftest
 import (
 	"fmt"
 	"math/rand/v2"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/nweber23/raftlab/internal/raft"
+	"github.com/nweber23/raftlab/internal/storage"
 	"github.com/nweber23/raftlab/internal/transport"
 )
 
@@ -60,6 +62,10 @@ type Cluster struct {
 	IDs   []raft.NodeID
 	Nodes map[raft.NodeID]*raft.Node
 	SMs   map[raft.NodeID]raft.StateMachine
+	WALs  map[raft.NodeID]*storage.WAL
+
+	dir      string
+	restarts map[raft.NodeID]uint64
 
 	leaderOfTerm map[uint64]raft.NodeID // election safety bookkeeping
 }
@@ -70,6 +76,7 @@ func NewCluster(t testing.TB, o Options) *Cluster {
 	c := &Cluster{
 		T: t, Opts: o, Clock: NewFakeClock(),
 		Nodes: map[raft.NodeID]*raft.Node{}, SMs: map[raft.NodeID]raft.StateMachine{},
+		WALs: map[raft.NodeID]*storage.WAL{}, dir: t.TempDir(), restarts: map[raft.NodeID]uint64{},
 		leaderOfTerm: map[uint64]raft.NodeID{},
 	}
 	c.Net = transport.NewNetwork(c.Clock, rand.New(rand.NewPCG(o.Seed, 0xfeed)))
@@ -88,12 +95,18 @@ func (c *Cluster) boot(id raft.NodeID) {
 	if c.Opts.Machine != nil {
 		sm = c.Opts.Machine(id)
 	}
+	// Crashes are modeled at process level, so fsync would only slow tests down.
+	wal, initial, err := storage.Open(filepath.Join(c.dir, fmt.Sprint(id)), storage.Options{NoSync: true})
+	if err != nil {
+		c.T.Fatalf("seed=%d: %v", c.Opts.Seed, err)
+	}
+	c.WALs[id] = wal
 	n, err := raft.New(raft.Config{
-		ID: id, Peers: c.IDs,
+		ID: id, Peers: c.IDs, Initial: initial, Storage: wal,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
 		Clock:             c.Clock, Transport: c.Net, Machine: sm,
-		Rand: rand.New(rand.NewPCG(c.Opts.Seed, uint64(id))),
+		Rand: rand.New(rand.NewPCG(c.Opts.Seed+c.restarts[id], uint64(id))),
 	})
 	if err != nil {
 		c.T.Fatalf("seed=%d: %v", c.Opts.Seed, err)
@@ -101,6 +114,20 @@ func (c *Cluster) boot(id raft.NodeID) {
 	c.Nodes[id], c.SMs[id] = n, sm
 	c.Net.Register(id, n.Handle)
 	n.Start()
+}
+
+// Crash kills node id: its timers stop, the network drops its traffic and its
+// volatile state is gone. Only what it wrote to its WAL survives.
+func (c *Cluster) Crash(id raft.NodeID) {
+	c.Nodes[id].Stop()
+	c.Net.Crash(id)
+	c.WALs[id].Close()
+}
+
+// Restart boots a fresh node for id from its WAL.
+func (c *Cluster) Restart(id raft.NodeID) {
+	c.restarts[id]++
+	c.boot(id)
 }
 
 // Fatalf fails the test and always names the seed.

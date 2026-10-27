@@ -19,6 +19,7 @@ type Config struct {
 	Clock     Clock
 	Transport Transport
 	Machine   StateMachine // nil means commands are committed but go nowhere
+	Storage   Storage      // nil means volatile: nothing survives a restart
 	Rand      *rand.Rand   // seeded by the caller; the core never touches global rand
 
 	Initial PersistentState // zero value on first boot
@@ -31,8 +32,7 @@ type Node struct {
 	cfg Config
 	mu  sync.Mutex
 
-	// Persistent state (Figure 2). Not yet written anywhere; see the
-	// persistence part.
+	// Persistent state (Figure 2), mirrored to cfg.Storage on every change.
 	currentTerm uint64
 	votedFor    NodeID
 	log         []Entry // log[0] is entry index 1
@@ -338,12 +338,27 @@ func (n *Node) applyCommitted() {
 }
 
 // persistAppend makes "log truncated to after, then entries appended" durable.
-// Wired up in the persistence step.
-func (n *Node) persistAppend(after uint64, entries []Entry) {}
+func (n *Node) persistAppend(after uint64, entries []Entry) {
+	if n.cfg.Storage != nil {
+		must(n.cfg.Storage.Append(after, entries))
+	}
+}
 
-// persistState writes currentTerm and votedFor to stable storage before the
-// node answers any RPC. Wired up in the persistence step.
-func (n *Node) persistState() {}
+// persistState writes currentTerm and votedFor to stable storage. It runs
+// before the node sends any message that depends on them.
+func (n *Node) persistState() {
+	if n.cfg.Storage != nil {
+		must(n.cfg.Storage.SaveState(n.currentTerm, n.votedFor))
+	}
+}
+
+// must turns a storage failure into a crash: answering from state that was
+// not saved could break Raft's safety guarantees.
+func must(err error) {
+	if err != nil {
+		panic("raft: storage failure: " + err.Error())
+	}
+}
 
 func (n *Node) handleRequestVote(from NodeID, a RequestVoteArgs) {
 	if a.Term > n.currentTerm {
