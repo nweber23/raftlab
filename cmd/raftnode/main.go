@@ -3,6 +3,9 @@
 // clients and the Raft RPCs for peers.
 //
 //	raftnode -id 1 -peers 1=127.0.0.1:7001,2=127.0.0.1:7002,3=127.0.0.1:7003 -data data
+//
+// If $RAFTLAB_TOKEN is set, peers must present it on /raft. It is read from
+// the environment only, so it never appears in the process list.
 package main
 
 import (
@@ -31,11 +34,10 @@ func main() {
 	id := flag.Uint("id", 0, "this node's ID (must appear in -peers)")
 	peerList := flag.String("peers", "", "comma-separated id=host:port for every node, this one included")
 	data := flag.String("data", "data", "directory for the write-ahead log (a subdirectory per node ID)")
-	token := flag.String("token", os.Getenv("RAFTLAB_TOKEN"), "shared secret peers must present on /raft (default $RAFTLAB_TOKEN)")
 	snap := flag.Int("snapshot-threshold", 1000, "compact the log after this many applied entries (0 = never)")
 	flag.Parse()
 
-	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), *token, *snap); err != nil {
+	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), os.Getenv("RAFTLAB_TOKEN"), *snap); err != nil {
 		log.Fatal(err)
 	}
 }
