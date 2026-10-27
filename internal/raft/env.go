@@ -24,13 +24,21 @@ type Clock interface {
 // StateMachine is the replicated application. Apply runs inside the node's
 // critical section, in log order, exactly once per committed non-empty
 // command; it must be fast and must not call back into the Node.
+//
+// Snapshot serializes the whole state as of the last Apply (it is called
+// inside the same critical section); Restore replaces the state with such an
+// image. Snapshot must return a fresh slice that is never modified later.
 type StateMachine interface {
 	Apply(index uint64, command []byte)
+	Snapshot() []byte
+	Restore(data []byte)
 }
 
 type noopMachine struct{}
 
 func (noopMachine) Apply(uint64, []byte) {}
+func (noopMachine) Snapshot() []byte     { return nil }
+func (noopMachine) Restore([]byte)       {}
 
 // Snapshot is a state-machine image covering the log up to and including Index.
 type Snapshot struct {

@@ -23,6 +23,10 @@ type Config struct {
 	Rand      *rand.Rand   // seeded by the caller; the core never touches global rand
 
 	Initial PersistentState // zero value on first boot
+
+	// SnapshotThreshold compacts the log once this many applied entries sit
+	// after the last snapshot. 0 disables compaction.
+	SnapshotThreshold int
 }
 
 // Node is one Raft server. All state is guarded by mu. Handlers (the lower
@@ -35,7 +39,10 @@ type Node struct {
 	// Persistent state (Figure 2), mirrored to cfg.Storage on every change.
 	currentTerm uint64
 	votedFor    NodeID
-	log         []Entry // log[0] is entry index 1
+	log         []Entry // log[0] has index snapIndex+1
+	snapIndex   uint64  // last index covered by the snapshot
+	snapTerm    uint64
+	snapData    []byte
 
 	// Volatile state.
 	role        Role
@@ -75,12 +82,18 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Machine == nil {
 		cfg.Machine = noopMachine{}
 	}
-	return &Node{
+	n := &Node{
 		cfg:         cfg,
 		currentTerm: cfg.Initial.Term,
 		votedFor:    cfg.Initial.VotedFor,
 		log:         append([]Entry(nil), cfg.Initial.Log...),
-	}, nil
+		snapIndex:   cfg.Initial.SnapIndex, snapTerm: cfg.Initial.SnapTerm, snapData: cfg.Initial.SnapData,
+		commitIndex: cfg.Initial.SnapIndex, lastApplied: cfg.Initial.SnapIndex,
+	}
+	if n.snapIndex > 0 {
+		cfg.Machine.Restore(n.snapData)
+	}
+	return n, nil
 }
 
 // Start arms the election timer. Until Start is called the node is inert.
@@ -111,7 +124,7 @@ func (n *Node) Status() Status {
 	return Status{
 		ID: n.cfg.ID, Role: n.role, Term: n.currentTerm, VotedFor: n.votedFor,
 		Leader: n.leader, CommitIndex: n.commitIndex, LastApplied: n.lastApplied,
-		LastIndex: n.lastIndex(), Log: append([]Entry(nil), n.log...),
+		LastIndex: n.lastIndex(), SnapIndex: n.snapIndex, Log: append([]Entry(nil), n.log...),
 	}
 }
 
@@ -131,6 +144,10 @@ func (n *Node) Handle(m Message) {
 		n.handleAppendEntries(m.From, b)
 	case AppendEntriesReply:
 		n.handleAppendEntriesReply(m.From, b)
+	case InstallSnapshotArgs:
+		n.handleInstallSnapshot(m.From, b)
+	case InstallSnapshotReply:
+		n.handleInstallSnapshotReply(m.From, b)
 	}
 }
 
@@ -141,15 +158,21 @@ func (n *Node) send(to NodeID, body any) {
 }
 
 // lastIndex is the index of the last log entry, 0 for an empty log.
-func (n *Node) lastIndex() uint64 { return uint64(len(n.log)) }
+func (n *Node) lastIndex() uint64 { return n.snapIndex + uint64(len(n.log)) }
 
-// termAt returns the term of the entry at index i; i == 0 is the empty-log
-// sentinel with term 0. The caller guarantees i <= lastIndex.
+// termAt returns the term of the entry at index i. i == snapIndex yields the
+// snapshot's term (0 for the empty-log sentinel); the caller guarantees
+// snapIndex <= i <= lastIndex.
 func (n *Node) termAt(i uint64) uint64 {
-	if i == 0 {
-		return 0
+	if i == n.snapIndex {
+		return n.snapTerm
 	}
-	return n.log[i-1].Term
+	return n.log[i-n.snapIndex-1].Term
+}
+
+// entries returns the log entries with index in (from, to].
+func (n *Node) entries(from, to uint64) []Entry {
+	return n.log[from-n.snapIndex : to-n.snapIndex]
 }
 
 // lastLog returns the index and term of the last log entry, or (0, 0) for an
@@ -252,7 +275,7 @@ func (n *Node) becomeLeader() {
 // appendLocal appends one entry in the current term to the leader's log.
 func (n *Node) appendLocal(cmd []byte) uint64 {
 	n.log = append(n.log, Entry{Term: n.currentTerm, Command: cmd})
-	n.persistAppend(n.lastIndex()-1, n.log[n.lastIndex()-1:])
+	n.persistAppend(n.lastIndex()-1, n.entries(n.lastIndex()-1, n.lastIndex()))
 	n.matchIndex[n.cfg.ID] = n.lastIndex()
 	n.advanceCommit() // a single-node cluster commits immediately
 	return n.lastIndex()
@@ -295,12 +318,19 @@ func (n *Node) broadcastHeartbeat() {
 // already hold. Add pipelining state if bandwidth matters.
 func (n *Node) sendAppend(p NodeID) {
 	next := n.nextIndex[p]
+	if next <= n.snapIndex { // the entries it needs are compacted away
+		n.send(p, InstallSnapshotArgs{
+			Term: n.currentTerm, LeaderID: n.cfg.ID,
+			LastIncludedIndex: n.snapIndex, LastIncludedTerm: n.snapTerm, Data: n.snapData,
+		})
+		return
+	}
 	prev := next - 1
 	hi := min(n.lastIndex(), prev+maxBatch)
 	n.send(p, AppendEntriesArgs{
 		Term: n.currentTerm, LeaderID: n.cfg.ID,
 		PrevLogIndex: prev, PrevLogTerm: n.termAt(prev),
-		Entries:      append([]Entry(nil), n.log[prev:hi]...),
+		Entries:      append([]Entry(nil), n.entries(prev, hi)...),
 		LeaderCommit: n.commitIndex,
 	})
 }
@@ -331,10 +361,25 @@ func (n *Node) advanceCommit() {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		if e := n.log[n.lastApplied-1]; len(e.Command) > 0 {
+		if e := n.log[n.lastApplied-n.snapIndex-1]; len(e.Command) > 0 {
 			n.cfg.Machine.Apply(n.lastApplied, e.Command)
 		}
 	}
+	if t := n.cfg.SnapshotThreshold; t > 0 && n.lastApplied-n.snapIndex >= uint64(t) {
+		n.compact()
+	}
+}
+
+// compact snapshots the state machine at lastApplied and drops the log prefix
+// it covers (§7). Only applied (hence committed) entries are ever discarded.
+func (n *Node) compact() {
+	idx := n.lastApplied
+	snap := Snapshot{Index: idx, Term: n.termAt(idx), Data: n.cfg.Machine.Snapshot()}
+	tail := append([]Entry(nil), n.entries(idx, n.lastIndex())...)
+	if n.cfg.Storage != nil {
+		must(n.cfg.Storage.SaveSnapshot(snap, tail))
+	}
+	n.snapIndex, n.snapTerm, n.snapData, n.log = snap.Index, snap.Term, snap.Data, tail
 }
 
 // persistAppend makes "log truncated to after, then entries appended" durable.
@@ -403,6 +448,19 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 	n.leader = a.LeaderID
 	n.resetElectionTimer()
 
+	// Entries at or below our snapshot are committed and identical to the
+	// leader's, so skip over them.
+	if a.PrevLogIndex < n.snapIndex {
+		skip := min(n.snapIndex-a.PrevLogIndex, uint64(len(a.Entries)))
+		a.Entries = a.Entries[skip:]
+		a.PrevLogIndex += skip
+		if a.PrevLogIndex < n.snapIndex { // all entries were older than the snapshot
+			n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: n.snapIndex})
+			return
+		}
+		a.PrevLogTerm = n.snapTerm
+	}
+
 	// Consistency check (Figure 2, step 2).
 	if a.PrevLogIndex > n.lastIndex() {
 		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: n.lastIndex() + 1})
@@ -410,7 +468,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 	}
 	if t := n.termAt(a.PrevLogIndex); t != a.PrevLogTerm {
 		first := a.PrevLogIndex
-		for first > 1 && n.termAt(first-1) == t {
+		for first > n.snapIndex+1 && n.termAt(first-1) == t {
 			first--
 		}
 		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: first, ConflictTerm: t})
@@ -425,7 +483,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 			if n.termAt(idx) == e.Term {
 				continue
 			}
-			n.log = n.log[:idx-1]
+			n.log = n.log[:idx-1-n.snapIndex]
 		}
 		n.log = append(n.log, a.Entries[i:]...)
 		n.persistAppend(idx-1, a.Entries[i:])
@@ -462,7 +520,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	if r.ConflictTerm != 0 {
 		// If we have entries of the follower's conflicting term, retry just
 		// after our last one; otherwise drop the whole term.
-		for i := n.lastIndex(); i >= 1; i-- {
+		for i := n.lastIndex(); i > n.snapIndex; i-- {
 			if n.termAt(i) == r.ConflictTerm {
 				next = i + 1
 				break
@@ -475,6 +533,51 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	next = max(next, n.matchIndex[from]+1, 1)
 	if next < n.nextIndex[from] { // otherwise a stale reply: ignore, no resend
 		n.nextIndex[from] = next
+		n.sendAppend(from)
+	}
+}
+
+func (n *Node) handleInstallSnapshot(from NodeID, a InstallSnapshotArgs) {
+	if a.Term < n.currentTerm {
+		n.send(from, InstallSnapshotReply{Term: n.currentTerm})
+		return
+	}
+	n.becomeFollower(a.Term)
+	n.leader = a.LeaderID
+	n.resetElectionTimer()
+
+	if a.LastIncludedIndex <= n.commitIndex { // we already have all of it
+		n.send(from, InstallSnapshotReply{Term: n.currentTerm, MatchIndex: a.LastIncludedIndex})
+		return
+	}
+	// If our log holds the snapshot's last entry, keep what follows it;
+	// otherwise the whole log is superseded (Figure 13, steps 6-7).
+	var tail []Entry
+	if a.LastIncludedIndex <= n.lastIndex() && n.termAt(a.LastIncludedIndex) == a.LastIncludedTerm {
+		tail = append(tail, n.entries(a.LastIncludedIndex, n.lastIndex())...)
+	}
+	snap := Snapshot{Index: a.LastIncludedIndex, Term: a.LastIncludedTerm, Data: a.Data}
+	if n.cfg.Storage != nil {
+		must(n.cfg.Storage.SaveSnapshot(snap, tail))
+	}
+	n.snapIndex, n.snapTerm, n.snapData, n.log = snap.Index, snap.Term, snap.Data, tail
+	n.commitIndex, n.lastApplied = snap.Index, snap.Index
+	n.cfg.Machine.Restore(snap.Data)
+	n.send(from, InstallSnapshotReply{Term: n.currentTerm, MatchIndex: snap.Index})
+}
+
+func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
+	if r.Term > n.currentTerm {
+		n.becomeFollower(r.Term)
+		return
+	}
+	if n.role != Leader || r.Term != n.currentTerm {
+		return
+	}
+	n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
+	n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
+	n.advanceCommit()
+	if n.nextIndex[from] <= n.lastIndex() {
 		n.sendAppend(from)
 	}
 }

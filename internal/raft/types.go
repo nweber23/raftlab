@@ -78,14 +78,30 @@ type AppendEntriesReply struct {
 	ConflictTerm  uint64 // on failure: term of the conflicting entry, 0 if the log was too short
 }
 
-// FirstIndex is the log index of Log[0] (1 until snapshots compact the log).
+// FirstIndex is the log index of Log[0] (SnapIndex+1).
 func (s Status) FirstIndex() uint64 { return s.LastIndex - uint64(len(s.Log)) + 1 }
 
 // EntryAt returns the entry at log index i, which must lie within Log.
 func (s Status) EntryAt(i uint64) Entry { return s.Log[i-s.FirstIndex()] }
 
-// Message is one datagram between two nodes. Body is one of the four
-// Args/Reply types above, passed by value.
+// InstallSnapshotArgs is the InstallSnapshot RPC request (Figure 13). The
+// whole snapshot travels in one message; there is no chunking.
+type InstallSnapshotArgs struct {
+	Term              uint64
+	LeaderID          NodeID
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	Data              []byte
+}
+
+// InstallSnapshotReply is the InstallSnapshot RPC response.
+type InstallSnapshotReply struct {
+	Term       uint64
+	MatchIndex uint64 // the follower's log now matches the leader's up to here
+}
+
+// Message is one datagram between two nodes. Body is one of the Args/Reply
+// types above, passed by value.
 type Message struct {
 	From, To NodeID
 	Body     any
@@ -115,6 +131,7 @@ type Status struct {
 	CommitIndex uint64
 	LastApplied uint64
 	LastIndex   uint64
+	SnapIndex   uint64  // log entries up to here are compacted into the snapshot
 	Log         []Entry // copy of the in-memory log; Log[0] has index LastIndex-len(Log)+1
 }
 
@@ -129,6 +146,10 @@ func (m Message) Kind() string {
 		return "AppendEntries"
 	case AppendEntriesReply:
 		return "AppendEntriesReply"
+	case InstallSnapshotArgs:
+		return "InstallSnapshot"
+	case InstallSnapshotReply:
+		return "InstallSnapshotReply"
 	}
 	return "Unknown"
 }
@@ -143,6 +164,10 @@ func (m Message) Term() uint64 {
 	case AppendEntriesArgs:
 		return b.Term
 	case AppendEntriesReply:
+		return b.Term
+	case InstallSnapshotArgs:
+		return b.Term
+	case InstallSnapshotReply:
 		return b.Term
 	}
 	return 0

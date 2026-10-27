@@ -1,6 +1,7 @@
 package raftest
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
@@ -37,6 +38,24 @@ func (r *Recorder) Apply(index uint64, cmd []byte) {
 	r.list = append(r.list, Applied{index, string(cmd)})
 }
 
+// Snapshot implements raft.StateMachine.
+func (r *Recorder) Snapshot() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, _ := json.Marshal(r.list)
+	return b
+}
+
+// Restore implements raft.StateMachine.
+func (r *Recorder) Restore(data []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.list = nil
+	if err := json.Unmarshal(data, &r.list); err != nil {
+		panic(err)
+	}
+}
+
 // Applied returns a copy of the applied commands in order.
 func (r *Recorder) Applied() []Applied {
 	r.mu.Lock()
@@ -48,6 +67,8 @@ func (r *Recorder) Applied() []Applied {
 type Options struct {
 	Size int
 	Seed uint64
+	// SnapshotThreshold is passed to every node (0 disables compaction).
+	SnapshotThreshold int
 	// Machine builds the state machine for a node; nil gives each node a Recorder.
 	Machine func(id raft.NodeID) raft.StateMachine
 }
@@ -105,7 +126,7 @@ func (c *Cluster) boot(id raft.NodeID) {
 		ID: id, Peers: c.IDs, Initial: initial, Storage: wal,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
-		Clock:             c.Clock, Transport: c.Net, Machine: sm,
+		Clock:             c.Clock, Transport: c.Net, Machine: sm, SnapshotThreshold: c.Opts.SnapshotThreshold,
 		Rand: rand.New(rand.NewPCG(c.Opts.Seed+c.restarts[id], uint64(id))),
 	})
 	if err != nil {
