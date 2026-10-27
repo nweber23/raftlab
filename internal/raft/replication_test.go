@@ -124,12 +124,6 @@ func TestConflictingUncommittedEntriesAreOverwritten(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		c.Nodes[old].Propose([]byte(fmt.Sprintf("doomed-%d", i)))
 	}
-	var rest []raft.NodeID
-	for _, id := range c.IDs {
-		if id != old {
-			rest = append(rest, id)
-		}
-	}
 	if !c.RunUntil(3*time.Second, func() bool {
 		l := c.Leader()
 		return l != raft.NoNode && l != old

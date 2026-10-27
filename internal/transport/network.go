@@ -80,11 +80,11 @@ func (n *Network) SetLoss(drop, dup float64) {
 	n.faults.DropRate, n.faults.DupRate = drop, dup
 }
 
-// SetDelay makes every message take a uniform random time in [min, max].
-func (n *Network) SetDelay(min, max time.Duration) {
+// SetDelay makes every message take a uniform random time in [lo, hi].
+func (n *Network) SetDelay(lo, hi time.Duration) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.faults.MinDelay, n.faults.MaxDelay = min, max
+	n.faults.MinDelay, n.faults.MaxDelay = lo, hi
 }
 
 // Partition splits the cluster: nodes can talk only within their own group.

@@ -7,6 +7,11 @@ linters:
     - errcheck
     - gocritic
     - misspell
+  exclusions:
+    rules:
+      # Tests may ignore Close/Write errors on throwaway files.
+      - path: _test\.go
+        linters: [errcheck]
 
 formatters:
   enable:

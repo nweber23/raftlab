@@ -147,7 +147,7 @@ func (c *Cluster) boot(id raft.NodeID) {
 func (c *Cluster) Crash(id raft.NodeID) {
 	c.Nodes[id].Stop()
 	c.Net.Crash(id)
-	c.WALs[id].Close()
+	_ = c.WALs[id].Close()
 }
 
 // Restart boots a fresh node for id from its WAL.
@@ -171,10 +171,10 @@ func (c *Cluster) Run(d time.Duration) {
 	}
 }
 
-// RunUntil runs until cond holds or max virtual time passes; it reports success.
-func (c *Cluster) RunUntil(max time.Duration, cond func() bool) bool {
+// RunUntil runs until cond holds or limit virtual time passes; it reports success.
+func (c *Cluster) RunUntil(limit time.Duration, cond func() bool) bool {
 	c.T.Helper()
-	for ; max > 0; max -= Step {
+	for ; limit > 0; limit -= Step {
 		if cond() {
 			return true
 		}

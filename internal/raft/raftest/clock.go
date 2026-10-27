@@ -23,7 +23,7 @@ type fakeTimer struct {
 	when  time.Duration
 	seq   uint64
 	f     func()
-	armed bool
+	armed bool // armed timers, and only they, are in FakeClock.timers
 }
 
 // NewFakeClock starts at t=0.
@@ -35,20 +35,39 @@ func (c *FakeClock) AfterFunc(d time.Duration, f func()) raft.Timer {
 	defer c.mu.Unlock()
 	t := &fakeTimer{c: c, f: f}
 	c.arm(t, d)
-	c.timers = append(c.timers, t)
 	return t
 }
 
+// arm and disarm keep timers limited to armed ones, so Advance stays cheap
+// even after millions of one-shot message timers.
 func (c *FakeClock) arm(t *fakeTimer, d time.Duration) {
 	c.seq++
-	t.when, t.seq, t.armed = c.now+d, c.seq, true
+	t.when, t.seq = c.now+d, c.seq
+	if !t.armed {
+		t.armed = true
+		c.timers = append(c.timers, t)
+	}
+}
+
+func (c *FakeClock) disarm(t *fakeTimer) {
+	if !t.armed {
+		return
+	}
+	t.armed = false
+	for i, x := range c.timers {
+		if x == t {
+			c.timers[i] = c.timers[len(c.timers)-1]
+			c.timers = c.timers[:len(c.timers)-1]
+			return
+		}
+	}
 }
 
 func (t *fakeTimer) Stop() bool {
 	t.c.mu.Lock()
 	defer t.c.mu.Unlock()
 	was := t.armed
-	t.armed = false
+	t.c.disarm(t)
 	return was
 }
 
@@ -81,7 +100,8 @@ func (c *FakeClock) Advance(d time.Duration) {
 			c.mu.Unlock()
 			return
 		}
-		c.now, next.armed = next.when, false
+		c.now = next.when
+		c.disarm(next)
 		c.mu.Unlock()
 		next.f()
 	}

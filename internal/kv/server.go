@@ -47,7 +47,7 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	st := s.Node.Status()
 	st.Log = nil
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"id": st.ID, "role": st.Role.String(), "term": st.Term,
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": st.ID, "role": st.Role.String(), "term": st.Term,
 		"leader": st.Leader, "commitIndex": st.CommitIndex, "lastApplied": st.LastApplied, "lastIndex": st.LastIndex})
 }
 
@@ -106,7 +106,7 @@ func (s *Server) serveKV(kind string) http.HandlerFunc {
 		case kind == OpGet && !res.Found:
 			http.Error(w, "not found", http.StatusNotFound)
 		case kind == OpGet:
-			io.WriteString(w, res.Value)
+			_, _ = io.WriteString(w, res.Value)
 		default:
 			w.WriteHeader(http.StatusNoContent)
 		}

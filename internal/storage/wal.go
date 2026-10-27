@@ -232,27 +232,27 @@ func (w *WAL) SaveSnapshot(s raft.Snapshot, tail []raft.Entry) error {
 	buf = append(buf, snapshotRecord(s)...)
 	buf = append(buf, appendRecord(s.Index, tail)...)
 	if _, err := nf.Write(buf); err != nil {
-		nf.Close()
+		_ = nf.Close()
 		return err
 	}
 	if !w.opts.NoSync {
 		if err := nf.Sync(); err != nil {
-			nf.Close()
+			_ = nf.Close()
 			return err
 		}
 	}
 	if err := os.Rename(tmp, w.path); err != nil {
-		nf.Close()
+		_ = nf.Close()
 		return err
 	}
 	if !w.opts.NoSync {
 		if err := syncDir(filepath.Dir(w.path)); err != nil {
-			nf.Close()
+			_ = nf.Close()
 			return err
 		}
 	}
-	w.f.Close()
-	w.f = nf // positioned at the end of the new file
+	_ = w.f.Close() // the old file is replaced; nothing more to flush
+	w.f = nf        // positioned at the end of the new file
 	return nil
 }
 
@@ -261,7 +261,7 @@ func syncDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 	return d.Sync()
 }
 
