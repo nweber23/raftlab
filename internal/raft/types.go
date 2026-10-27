@@ -92,10 +92,16 @@ type Message struct {
 }
 
 // PersistentState is what Figure 2 says must survive a restart.
+//
+// Log holds the entries after the snapshot: Log[0] has index SnapIndex+1.
 type PersistentState struct {
 	Term     uint64
 	VotedFor NodeID
 	Log      []Entry
+
+	SnapIndex uint64 // last log index covered by the snapshot, 0 if none
+	SnapTerm  uint64
+	SnapData  []byte
 }
 
 // Status is a point-in-time snapshot of a node, for tests and the visualizer.

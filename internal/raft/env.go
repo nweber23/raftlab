@@ -31,3 +31,23 @@ type StateMachine interface {
 type noopMachine struct{}
 
 func (noopMachine) Apply(uint64, []byte) {}
+
+// Snapshot is a state-machine image covering the log up to and including Index.
+type Snapshot struct {
+	Index, Term uint64
+	Data        []byte
+}
+
+// Storage makes state durable. Every method must return only after the data
+// is on stable storage: the node replies to RPCs and acknowledges commands
+// after calling it. An error is fatal; the node panics rather than answer
+// from state it could not save.
+type Storage interface {
+	// SaveState records currentTerm and votedFor.
+	SaveState(term uint64, votedFor NodeID) error
+	// Append truncates the log after index `after`, then appends entries.
+	Append(after uint64, entries []Entry) error
+	// SaveSnapshot replaces the log prefix with s; tail holds the entries
+	// that follow s.Index.
+	SaveSnapshot(s Snapshot, tail []Entry) error
+}
