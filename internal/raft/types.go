@@ -94,3 +94,33 @@ type Status struct {
 	Leader   NodeID // NoNode if unknown
 	LogLen   uint64
 }
+
+// Kind names the RPC carried by m, for logs and the visualizer.
+func (m Message) Kind() string {
+	switch m.Body.(type) {
+	case RequestVoteArgs:
+		return "RequestVote"
+	case RequestVoteReply:
+		return "RequestVoteReply"
+	case AppendEntriesArgs:
+		return "AppendEntries"
+	case AppendEntriesReply:
+		return "AppendEntriesReply"
+	}
+	return "Unknown"
+}
+
+// Term returns the term carried by m's body, or 0 if it has none.
+func (m Message) Term() uint64 {
+	switch b := m.Body.(type) {
+	case RequestVoteArgs:
+		return b.Term
+	case RequestVoteReply:
+		return b.Term
+	case AppendEntriesArgs:
+		return b.Term
+	case AppendEntriesReply:
+		return b.Term
+	}
+	return 0
+}
