@@ -71,6 +71,8 @@ type Options struct {
 	SnapshotThreshold int
 	// Machine builds the state machine for a node; nil gives each node a Recorder.
 	Machine func(id raft.NodeID) raft.StateMachine
+	// OnBoot, if set, runs for every node (including restarts) just before it starts.
+	OnBoot func(id raft.NodeID, n *raft.Node, sm raft.StateMachine)
 }
 
 // Cluster is a deterministic in-process Raft cluster: fake clock, faulty
@@ -134,6 +136,9 @@ func (c *Cluster) boot(id raft.NodeID) {
 	}
 	c.Nodes[id], c.SMs[id] = n, sm
 	c.Net.Register(id, n.Handle)
+	if c.Opts.OnBoot != nil {
+		c.Opts.OnBoot(id, n, sm)
+	}
 	n.Start()
 }
 
