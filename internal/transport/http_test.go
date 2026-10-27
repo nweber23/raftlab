@@ -41,13 +41,13 @@ func TestCodecRoundTrip(t *testing.T) {
 func TestHTTPDeliversBetweenNodes(t *testing.T) {
 	var mu sync.Mutex
 	var got []raft.Message
-	srv := httptest.NewServer(transport.Handler(func(m raft.Message) {
+	srv := httptest.NewServer(transport.Handler(2, []raft.NodeID{1, 2}, "s3cret", func(m raft.Message) {
 		mu.Lock()
 		defer mu.Unlock()
 		got = append(got, m)
 	}))
 	defer srv.Close()
-	h := transport.NewHTTP(map[raft.NodeID]string{2: srv.URL})
+	h := transport.NewHTTP(map[raft.NodeID]string{2: srv.URL}, "s3cret")
 	defer h.Close()
 	for i := 0; i < 5; i++ {
 		h.Send(raft.Message{From: 1, To: 2, Body: raft.AppendEntriesArgs{Term: uint64(i)}})
@@ -78,7 +78,7 @@ func TestHTTPSendToDeadPeerNeverBlocks(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	url := srv.URL
 	srv.Close() // nobody listens any more
-	h := transport.NewHTTP(map[raft.NodeID]string{2: url})
+	h := transport.NewHTTP(map[raft.NodeID]string{2: url}, "")
 	defer h.Close()
 	done := make(chan struct{})
 	go func() {
@@ -96,7 +96,7 @@ func TestHTTPSendToDeadPeerNeverBlocks(t *testing.T) {
 
 func TestHandlerRejectsGarbage(t *testing.T) {
 	rec := httptest.NewRecorder()
-	transport.Handler(func(raft.Message) { t.Fatal("delivered garbage") }).
+	transport.Handler(2, []raft.NodeID{1, 2}, "", func(raft.Message) { t.Fatal("delivered garbage") }).
 		ServeHTTP(rec, httptest.NewRequest("POST", "/raft", nopBody("not json")))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status %d", rec.Code)
@@ -104,3 +104,40 @@ func TestHandlerRejectsGarbage(t *testing.T) {
 }
 
 func nopBody(s string) *strings.Reader { return strings.NewReader(s) }
+
+func TestHandlerAuthAndAddressing(t *testing.T) {
+	var delivered int
+	h := transport.Handler(2, []raft.NodeID{1, 2, 3}, "tok", func(raft.Message) { delivered++ })
+	post := func(token string, m raft.Message) int {
+		b, _ := transport.Encode(m)
+		req := httptest.NewRequest("POST", "/raft", strings.NewReader(string(b)))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	ok := raft.Message{From: 1, To: 2, Body: raft.AppendEntriesArgs{Term: 1}}
+	if c := post("tok", ok); c != http.StatusNoContent {
+		t.Fatalf("valid message: %d", c)
+	}
+	for name, tc := range map[string]struct {
+		token string
+		msg   raft.Message
+		want  int
+	}{
+		"no token":      {"", ok, http.StatusUnauthorized},
+		"wrong token":   {"nope", ok, http.StatusUnauthorized},
+		"unknown peer":  {"tok", raft.Message{From: 9, To: 2, Body: ok.Body}, http.StatusForbidden},
+		"spoofed self":  {"tok", raft.Message{From: 2, To: 2, Body: ok.Body}, http.StatusForbidden},
+		"wrong address": {"tok", raft.Message{From: 1, To: 3, Body: ok.Body}, http.StatusForbidden},
+	} {
+		if c := post(tc.token, tc.msg); c != tc.want {
+			t.Errorf("%s: got %d, want %d", name, c, tc.want)
+		}
+	}
+	if delivered != 1 {
+		t.Fatalf("delivered %d messages, want only the valid one", delivered)
+	}
+}
