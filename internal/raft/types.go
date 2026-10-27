@@ -66,10 +66,23 @@ type AppendEntriesArgs struct {
 }
 
 // AppendEntriesReply is the AppendEntries RPC response (Figure 2).
+//
+// The fields after Success are the usual optimizations: MatchIndex lets the
+// leader place a reply even if it is duplicated or reordered, and the
+// Conflict hint lets it skip back a whole term per round trip (§5.3).
 type AppendEntriesReply struct {
-	Term    uint64
-	Success bool
+	Term          uint64
+	Success       bool
+	MatchIndex    uint64 // on success: last index known to match the leader
+	ConflictIndex uint64 // on failure: where the leader should retry from
+	ConflictTerm  uint64 // on failure: term of the conflicting entry, 0 if the log was too short
 }
+
+// FirstIndex is the log index of Log[0] (1 until snapshots compact the log).
+func (s Status) FirstIndex() uint64 { return s.LastIndex - uint64(len(s.Log)) + 1 }
+
+// EntryAt returns the entry at log index i, which must lie within Log.
+func (s Status) EntryAt(i uint64) Entry { return s.Log[i-s.FirstIndex()] }
 
 // Message is one datagram between two nodes. Body is one of the four
 // Args/Reply types above, passed by value.
@@ -92,7 +105,11 @@ type Status struct {
 	Term     uint64
 	VotedFor NodeID
 	Leader   NodeID // NoNode if unknown
-	LogLen   uint64
+
+	CommitIndex uint64
+	LastApplied uint64
+	LastIndex   uint64
+	Log         []Entry // copy of the in-memory log; Log[0] has index LastIndex-len(Log)+1
 }
 
 // Kind names the RPC carried by m, for logs and the visualizer.

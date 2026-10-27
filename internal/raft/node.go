@@ -18,7 +18,8 @@ type Config struct {
 
 	Clock     Clock
 	Transport Transport
-	Rand      *rand.Rand // seeded by the caller; the core never touches global rand
+	Machine   StateMachine // nil means commands are committed but go nowhere
+	Rand      *rand.Rand   // seeded by the caller; the core never touches global rand
 
 	Initial PersistentState // zero value on first boot
 }
@@ -37,9 +38,15 @@ type Node struct {
 	log         []Entry // log[0] is entry index 1
 
 	// Volatile state.
-	role   Role
-	leader NodeID
-	votes  map[NodeID]bool // candidate only: who granted us a vote this term
+	role        Role
+	leader      NodeID
+	votes       map[NodeID]bool // candidate only: who granted us a vote this term
+	commitIndex uint64
+	lastApplied uint64
+
+	// Leader only, reinitialized on election (Figure 2).
+	nextIndex  map[NodeID]uint64
+	matchIndex map[NodeID]uint64
 
 	electionTimer  Timer
 	heartbeatTimer Timer
@@ -64,6 +71,9 @@ func New(cfg Config) (*Node, error) {
 	}
 	if !self {
 		return nil, errors.New("raft: Peers must include ID")
+	}
+	if cfg.Machine == nil {
+		cfg.Machine = noopMachine{}
 	}
 	return &Node{
 		cfg:         cfg,
@@ -100,7 +110,8 @@ func (n *Node) Status() Status {
 	defer n.mu.Unlock()
 	return Status{
 		ID: n.cfg.ID, Role: n.role, Term: n.currentTerm, VotedFor: n.votedFor,
-		Leader: n.leader, LogLen: uint64(len(n.log)),
+		Leader: n.leader, CommitIndex: n.commitIndex, LastApplied: n.lastApplied,
+		LastIndex: n.lastIndex(), Log: append([]Entry(nil), n.log...),
 	}
 }
 
@@ -129,13 +140,22 @@ func (n *Node) send(to NodeID, body any) {
 	n.cfg.Transport.Send(Message{From: n.cfg.ID, To: to, Body: body})
 }
 
+// lastIndex is the index of the last log entry, 0 for an empty log.
+func (n *Node) lastIndex() uint64 { return uint64(len(n.log)) }
+
+// termAt returns the term of the entry at index i; i == 0 is the empty-log
+// sentinel with term 0. The caller guarantees i <= lastIndex.
+func (n *Node) termAt(i uint64) uint64 {
+	if i == 0 {
+		return 0
+	}
+	return n.log[i-1].Term
+}
+
 // lastLog returns the index and term of the last log entry, or (0, 0) for an
 // empty log.
 func (n *Node) lastLog() (index, term uint64) {
-	if len(n.log) == 0 {
-		return 0, 0
-	}
-	return uint64(len(n.log)), n.log[len(n.log)-1].Term
+	return n.lastIndex(), n.termAt(n.lastIndex())
 }
 
 // randomElectionTimeout picks uniformly from [Min, Max].
@@ -215,20 +235,51 @@ func (n *Node) startElection() {
 	}
 }
 
-// becomeLeader switches to leader and sends the first heartbeats.
+// becomeLeader switches to leader, appends a no-op so entries from earlier
+// terms can commit (§5.4.2, §8), and sends the first AppendEntries.
 func (n *Node) becomeLeader() {
 	n.role, n.leader, n.votes = Leader, n.cfg.ID, nil
 	n.electionTimer.Stop()
+	n.nextIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
+	n.matchIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
+	for _, p := range n.cfg.Peers {
+		n.nextIndex[p] = n.lastIndex() + 1
+	}
+	n.appendLocal(nil)
 	n.broadcastHeartbeat()
 }
 
-// broadcastHeartbeat sends an empty AppendEntries to every peer and re-arms
-// the heartbeat timer.
+// appendLocal appends one entry in the current term to the leader's log.
+func (n *Node) appendLocal(cmd []byte) uint64 {
+	n.log = append(n.log, Entry{Term: n.currentTerm, Command: cmd})
+	n.persistAppend(n.lastIndex()-1, n.log[n.lastIndex()-1:])
+	n.matchIndex[n.cfg.ID] = n.lastIndex()
+	n.advanceCommit() // a single-node cluster commits immediately
+	return n.lastIndex()
+}
+
+// Propose appends command to the log if this node is the leader. It returns
+// the entry's index and term; whether it commits is learned through the
+// StateMachine. ok is false on a non-leader.
+func (n *Node) Propose(command []byte) (index, term uint64, ok bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped || n.role != Leader || len(command) == 0 {
+		return 0, 0, false
+	}
+	index = n.appendLocal(command)
+	n.broadcastHeartbeat()
+	return index, n.currentTerm, true
+}
+
+const maxBatch = 64 // entries per AppendEntries
+
+// broadcastHeartbeat replicates to every peer (an empty AppendEntries when
+// the peer is caught up) and re-arms the heartbeat timer.
 func (n *Node) broadcastHeartbeat() {
-	li, lt := n.lastLog()
 	for _, p := range n.cfg.Peers {
 		if p != n.cfg.ID {
-			n.send(p, AppendEntriesArgs{Term: n.currentTerm, LeaderID: n.cfg.ID, PrevLogIndex: li, PrevLogTerm: lt})
+			n.sendAppend(p)
 		}
 	}
 	if n.heartbeatTimer == nil {
@@ -237,6 +288,58 @@ func (n *Node) broadcastHeartbeat() {
 	}
 	n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
 }
+
+// sendAppend sends peer p the entries from nextIndex[p] on.
+// ponytail: nothing tracks what is already in flight, so a burst of proposals
+// resends overlapping batches; harmless because followers skip entries they
+// already hold. Add pipelining state if bandwidth matters.
+func (n *Node) sendAppend(p NodeID) {
+	next := n.nextIndex[p]
+	prev := next - 1
+	hi := min(n.lastIndex(), prev+maxBatch)
+	n.send(p, AppendEntriesArgs{
+		Term: n.currentTerm, LeaderID: n.cfg.ID,
+		PrevLogIndex: prev, PrevLogTerm: n.termAt(prev),
+		Entries:      append([]Entry(nil), n.log[prev:hi]...),
+		LeaderCommit: n.commitIndex,
+	})
+}
+
+// advanceCommit moves commitIndex to the highest index stored on a majority
+// whose entry is from the current term (§5.4.2), then applies.
+func (n *Node) advanceCommit() {
+	for i := n.lastIndex(); i > n.commitIndex; i-- {
+		if n.termAt(i) != n.currentTerm {
+			break // older terms commit only indirectly
+		}
+		count := 0
+		for _, p := range n.cfg.Peers {
+			if n.matchIndex[p] >= i {
+				count++
+			}
+		}
+		if count >= n.majority() {
+			n.commitIndex = i
+			n.applyCommitted()
+			return
+		}
+	}
+}
+
+// applyCommitted feeds newly committed entries to the state machine. Empty
+// commands are leader no-ops and are skipped.
+func (n *Node) applyCommitted() {
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		if e := n.log[n.lastApplied-1]; len(e.Command) > 0 {
+			n.cfg.Machine.Apply(n.lastApplied, e.Command)
+		}
+	}
+}
+
+// persistAppend makes "log truncated to after, then entries appended" durable.
+// Wired up in the persistence step.
+func (n *Node) persistAppend(after uint64, entries []Entry) {}
 
 // persistState writes currentTerm and votedFor to stable storage before the
 // node answers any RPC. Wired up in the persistence step.
@@ -284,11 +387,79 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 	n.becomeFollower(a.Term)
 	n.leader = a.LeaderID
 	n.resetElectionTimer()
-	n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true})
+
+	// Consistency check (Figure 2, step 2).
+	if a.PrevLogIndex > n.lastIndex() {
+		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: n.lastIndex() + 1})
+		return
+	}
+	if t := n.termAt(a.PrevLogIndex); t != a.PrevLogTerm {
+		first := a.PrevLogIndex
+		for first > 1 && n.termAt(first-1) == t {
+			first--
+		}
+		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: first, ConflictTerm: t})
+		return
+	}
+
+	// Steps 3-4: truncate only at a real conflict, so a stale or duplicated
+	// RPC can never erase entries that a newer one already delivered.
+	for i, e := range a.Entries {
+		idx := a.PrevLogIndex + 1 + uint64(i)
+		if idx <= n.lastIndex() {
+			if n.termAt(idx) == e.Term {
+				continue
+			}
+			n.log = n.log[:idx-1]
+		}
+		n.log = append(n.log, a.Entries[i:]...)
+		n.persistAppend(idx-1, a.Entries[i:])
+		break
+	}
+
+	match := a.PrevLogIndex + uint64(len(a.Entries))
+	if a.LeaderCommit > n.commitIndex {
+		n.commitIndex = min(a.LeaderCommit, match)
+		n.applyCommitted()
+	}
+	n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: match})
 }
 
 func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	if r.Term > n.currentTerm {
 		n.becomeFollower(r.Term)
+		return
+	}
+	if n.role != Leader || r.Term != n.currentTerm {
+		return
+	}
+	if r.Success {
+		n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
+		n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
+		n.advanceCommit()
+		if n.nextIndex[from] <= n.lastIndex() {
+			n.sendAppend(from) // more to ship
+		}
+		return
+	}
+	// Conflict repair: jump back to where the follower's log can diverge.
+	next := r.ConflictIndex
+	if r.ConflictTerm != 0 {
+		// If we have entries of the follower's conflicting term, retry just
+		// after our last one; otherwise drop the whole term.
+		for i := n.lastIndex(); i >= 1; i-- {
+			if n.termAt(i) == r.ConflictTerm {
+				next = i + 1
+				break
+			}
+			if n.termAt(i) < r.ConflictTerm {
+				break
+			}
+		}
+	}
+	next = max(next, n.matchIndex[from]+1, 1)
+	if next < n.nextIndex[from] { // otherwise a stale reply: ignore, no resend
+		n.nextIndex[from] = next
+		n.sendAppend(from)
 	}
 }

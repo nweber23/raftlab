@@ -20,3 +20,14 @@ type Timer interface {
 type Clock interface {
 	AfterFunc(d time.Duration, f func()) Timer
 }
+
+// StateMachine is the replicated application. Apply runs inside the node's
+// critical section, in log order, exactly once per committed non-empty
+// command; it must be fast and must not call back into the Node.
+type StateMachine interface {
+	Apply(index uint64, command []byte)
+}
+
+type noopMachine struct{}
+
+func (noopMachine) Apply(uint64, []byte) {}
