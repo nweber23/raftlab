@@ -33,3 +33,4 @@ go.work.sum
 .vscode/
 .claude
 bin/
+.playwright-mcp/

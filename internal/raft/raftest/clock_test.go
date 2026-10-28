@@ -11,7 +11,7 @@ func TestFakeClockOrderStopReset(t *testing.T) {
 	c.AfterFunc(20*time.Millisecond, func() { got = append(got, "b") })
 	c.AfterFunc(10*time.Millisecond, func() { got = append(got, "a") })
 	stopped := c.AfterFunc(15*time.Millisecond, func() { got = append(got, "x") })
-	re := c.AfterFunc(5*time.Millisecond, func() { got = append(got, "r") })
+	re := c.AfterFunc(5*time.Millisecond, func() { got = append(got, "r") }).(*fakeTimer)
 	stopped.Stop()
 	re.Reset(30 * time.Millisecond)
 	c.Advance(25 * time.Millisecond)

@@ -55,8 +55,13 @@ type Node struct {
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 
+	// Timers are replaced, never Reset, and each carries a generation: a
+	// real clock can run a callback that fired just before it was stopped,
+	// and that stale callback must not start an election or send a heartbeat.
 	electionTimer  Timer
+	electionGen    uint64
 	heartbeatTimer Timer
+	heartbeatGen   uint64
 	stopped        bool
 }
 
@@ -109,12 +114,8 @@ func (n *Node) Stop() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.stopped = true
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
-	if n.heartbeatTimer != nil {
-		n.heartbeatTimer.Stop()
-	}
+	n.stopElectionTimer()
+	n.stopHeartbeatTimer()
 }
 
 // Status returns a snapshot of the node.
@@ -188,12 +189,29 @@ func (n *Node) randomElectionTimeout() time.Duration {
 }
 
 func (n *Node) resetElectionTimer() {
-	d := n.randomElectionTimeout()
-	if n.electionTimer == nil {
-		n.electionTimer = n.cfg.Clock.AfterFunc(d, n.onElectionTimeout)
-		return
+	n.stopElectionTimer()
+	gen := n.electionGen
+	n.electionTimer = n.cfg.Clock.AfterFunc(n.randomElectionTimeout(), func() { n.onElectionTimeout(gen) })
+}
+
+func (n *Node) stopElectionTimer() {
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
 	}
-	n.electionTimer.Reset(d)
+	n.electionGen++
+}
+
+func (n *Node) resetHeartbeatTimer() {
+	n.stopHeartbeatTimer()
+	gen := n.heartbeatGen
+	n.heartbeatTimer = n.cfg.Clock.AfterFunc(n.cfg.HeartbeatInterval, func() { n.onHeartbeatTimer(gen) })
+}
+
+func (n *Node) stopHeartbeatTimer() {
+	if n.heartbeatTimer != nil {
+		n.heartbeatTimer.Stop()
+	}
+	n.heartbeatGen++
 }
 
 func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
@@ -201,22 +219,22 @@ func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 // --- election ---------------------------------------------------------------
 
 // onElectionTimeout is the election timer callback. It runs on the clock's
-// goroutine, so it must take mu itself. A timer that fired just before a Reset
-// can still call in, hence the role check.
-func (n *Node) onElectionTimeout() {
+// goroutine, so it must take mu itself. gen identifies the timer that fired;
+// a stale one is ignored.
+func (n *Node) onElectionTimeout(gen uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role == Leader {
+	if n.stopped || n.role == Leader || gen != n.electionGen {
 		return
 	}
 	n.startElection()
 }
 
 // onHeartbeatTimer is the heartbeat timer callback; it also takes mu itself.
-func (n *Node) onHeartbeatTimer() {
+func (n *Node) onHeartbeatTimer(gen uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Leader {
+	if n.stopped || n.role != Leader || gen != n.heartbeatGen {
 		return
 	}
 	n.broadcastHeartbeat()
@@ -230,9 +248,7 @@ func (n *Node) becomeFollower(term uint64) {
 		n.persistState()
 	}
 	n.role, n.votes = Follower, nil
-	if n.heartbeatTimer != nil {
-		n.heartbeatTimer.Stop()
-	}
+	n.stopHeartbeatTimer()
 	if wasLeader {
 		n.resetElectionTimer() // becomeLeader stopped it
 	}
@@ -262,7 +278,7 @@ func (n *Node) startElection() {
 // terms can commit (§5.4.2, §8), and sends the first AppendEntries.
 func (n *Node) becomeLeader() {
 	n.role, n.leader, n.votes = Leader, n.cfg.ID, nil
-	n.electionTimer.Stop()
+	n.stopElectionTimer()
 	n.nextIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
 	n.matchIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
 	for _, p := range n.cfg.Peers {
@@ -305,11 +321,7 @@ func (n *Node) broadcastHeartbeat() {
 			n.sendAppend(p)
 		}
 	}
-	if n.heartbeatTimer == nil {
-		n.heartbeatTimer = n.cfg.Clock.AfterFunc(n.cfg.HeartbeatInterval, n.onHeartbeatTimer)
-		return
-	}
-	n.heartbeatTimer.Reset(n.cfg.HeartbeatInterval)
+	n.resetHeartbeatTimer()
 }
 
 // sendAppend sends peer p the entries from nextIndex[p] on.

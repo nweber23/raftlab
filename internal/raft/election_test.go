@@ -201,3 +201,43 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		}
 	}
 }
+
+// staleClock records every callback and lets a test run one by hand even
+// after its timer was stopped, as a real clock can when the callback has
+// already been dispatched by the time Stop is called.
+type staleClock struct{ fns []func() }
+
+type noStop struct{}
+
+func (noStop) Stop() bool { return true }
+
+func (c *staleClock) AfterFunc(_ time.Duration, f func()) raft.Timer {
+	c.fns = append(c.fns, f)
+	return noStop{}
+}
+
+func TestStaleElectionTimerIsIgnored(t *testing.T) {
+	clk := &staleClock{}
+	sent := &raftest.Sent{}
+	n, err := raft.New(raft.Config{
+		ID: 2, Peers: []raft.NodeID{1, 2, 3},
+		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
+		HeartbeatInterval: 50 * time.Millisecond,
+		Clock:             clk, Transport: sent, Rand: rand.New(rand.NewPCG(1, 1)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.Start()
+	stale := clk.fns[0]
+	// A heartbeat arrives and re-arms the timer; then the old callback runs.
+	n.Handle(raft.Message{From: 1, To: 2, Body: raft.AppendEntriesArgs{Term: 1, LeaderID: 1}})
+	stale()
+	if s := n.Status(); s.Role != raft.Follower || s.Term != 1 {
+		t.Fatalf("stale timer changed state: role=%v term=%d", s.Role, s.Term)
+	}
+	clk.fns[len(clk.fns)-1]() // the current timer does fire
+	if s := n.Status(); s.Role != raft.Candidate || s.Term != 2 {
+		t.Fatalf("live timer ignored: role=%v term=%d", s.Role, s.Term)
+	}
+}

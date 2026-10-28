@@ -12,7 +12,6 @@ type Transport interface {
 // Timer is the subset of *time.Timer the core needs.
 type Timer interface {
 	Stop() bool
-	Reset(d time.Duration) bool
 }
 
 // Clock is the core's only source of time. Production code backs it with
