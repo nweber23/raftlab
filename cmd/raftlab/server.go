@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,6 +62,12 @@ func (h *hub) broadcast(v any) {
 type Server struct {
 	lab *Lab
 	hub hub
+
+	// LoopbackOnly, set when listening on a loopback address, makes every
+	// request with a non-loopback Host header fail. That defeats DNS
+	// rebinding, where a hostile name resolves to 127.0.0.1 and the browser
+	// then treats this server as same-origin with the attacker's page.
+	LoopbackOnly bool
 }
 
 // NewServer wires lab's message events into the hub and returns the handler.
@@ -105,15 +113,27 @@ func (s *Server) Handler() http.Handler {
 		}
 		http.StripPrefix("/node/"+r.PathValue("id"), s.lab.NodeHandler(raft.NodeID(id))).ServeHTTP(w, r)
 	})
-	return sameOriginWrites(mux)
+	return s.guard(mux)
 }
 
-// sameOriginWrites rejects state-changing requests that a browser marks as
-// coming from another origin, so a web page elsewhere cannot make the user's
-// browser crash nodes or write keys on localhost. Non-browser clients send no
-// Origin header and pass.
-func sameOriginWrites(next http.Handler) http.Handler {
+func isLoopbackHost(hostport string) bool {
+	h, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		h = strings.Trim(hostport, "[]")
+	}
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+// guard applies the Host allowlist (see LoopbackOnly) and rejects
+// state-changing requests that a browser marks as coming from another origin,
+// so a web page elsewhere cannot make the user's browser crash nodes or write
+// keys on localhost. Non-browser clients send no Origin header and pass.
+func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.LoopbackOnly && !isLoopbackHost(r.Host) {
+			http.Error(w, "unexpected Host header", http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if o := r.Header.Get("Origin"); o != "" {
 				if u, err := url.Parse(o); err != nil || u.Host != r.Host {

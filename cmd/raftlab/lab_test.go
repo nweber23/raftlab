@@ -227,3 +227,27 @@ func TestCrossOriginWritesRefused(t *testing.T) {
 		t.Fatalf("huge delay accepted: %d", r.StatusCode)
 	}
 }
+
+func TestLoopbackOnlyRejectsForeignHost(t *testing.T) {
+	s := NewServer(newTestLab(t))
+	s.LoopbackOnly = true
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	get := func(host string) int {
+		req, _ := http.NewRequest("GET", srv.URL+"/", nil)
+		req.Host = host
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+	for host, want := range map[string]int{
+		"evil.example:8080": http.StatusForbidden, "localhost:8080": 200, "127.0.0.1:8080": 200, "[::1]:8080": 200,
+	} {
+		if got := get(host); got != want {
+			t.Errorf("Host %q: %d, want %d", host, got, want)
+		}
+	}
+}

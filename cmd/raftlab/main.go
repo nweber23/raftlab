@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -52,7 +51,8 @@ func run(addr string, size int, data string) error {
 		defer cancel()
 		_ = hs.Shutdown(shutdown)
 	}()
-	if host, _, err := net.SplitHostPort(addr); err != nil || (host != "127.0.0.1" && host != "localhost" && host != "::1") {
+	srv.LoopbackOnly = isLoopbackHost(addr)
+	if !srv.LoopbackOnly {
 		log.Printf("warning: %s is not loopback; anyone who can reach it can crash nodes and rewrite data", addr)
 	}
 	log.Printf("raftlab: %d nodes, visualizer on http://%s", size, addr)
