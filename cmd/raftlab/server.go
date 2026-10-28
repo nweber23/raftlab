@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -104,7 +105,25 @@ func (s *Server) Handler() http.Handler {
 		}
 		http.StripPrefix("/node/"+r.PathValue("id"), s.lab.NodeHandler(raft.NodeID(id))).ServeHTTP(w, r)
 	})
-	return mux
+	return sameOriginWrites(mux)
+}
+
+// sameOriginWrites rejects state-changing requests that a browser marks as
+// coming from another origin, so a web page elsewhere cannot make the user's
+// browser crash nodes or write keys on localhost. Non-browser clients send no
+// Origin header and pass.
+func sameOriginWrites(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if o := r.Header.Get("Origin"); o != "" {
+				if u, err := url.Parse(o); err != nil || u.Host != r.Host {
+					http.Error(w, "cross-origin request refused", http.StatusForbidden)
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) ws(w http.ResponseWriter, r *http.Request) {
@@ -174,7 +193,8 @@ func (s *Server) network(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.MinDelayMs < 0 || req.MaxDelayMs < req.MinDelayMs || req.DropRate < 0 || req.DropRate > 1 || req.DupRate < 0 || req.DupRate > 1 {
+	const maxDelayMs = 60_000
+	if req.MinDelayMs < 0 || req.MaxDelayMs < req.MinDelayMs || req.MaxDelayMs > maxDelayMs || req.DropRate < 0 || req.DropRate > 1 || req.DupRate < 0 || req.DupRate > 1 {
 		http.Error(w, "values out of range", http.StatusBadRequest)
 		return
 	}

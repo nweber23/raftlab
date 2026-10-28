@@ -158,7 +158,7 @@ func TestWebSocketStreamsStateAndMessages(t *testing.T) {
 	defer func() { _ = c.CloseNow() }()
 
 	var gotState, gotMsg bool
-	for !(gotState && gotMsg) {
+	for !gotState || !gotMsg {
 		_, b, err := c.Read(ctx)
 		if err != nil {
 			t.Fatalf("read: %v (state=%v msg=%v)", err, gotState, gotMsg)
@@ -193,5 +193,37 @@ func TestStaticFilesServed(t *testing.T) {
 		if r.StatusCode != 200 || len(b) == 0 {
 			t.Errorf("%s: %d, %d bytes", p, r.StatusCode, len(b))
 		}
+	}
+}
+
+func TestCrossOriginWritesRefused(t *testing.T) {
+	lab := newTestLab(t)
+	srv := httptest.NewServer(NewServer(lab).Handler())
+	defer srv.Close()
+	do := func(origin string) int {
+		req, _ := http.NewRequest("POST", srv.URL+"/api/crash?id=1", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = r.Body.Close()
+		return r.StatusCode
+	}
+	if c := do("https://evil.example"); c != http.StatusForbidden {
+		t.Fatalf("cross-origin: %d", c)
+	}
+	if !lab.State().Nodes[0].Up {
+		t.Fatal("cross-origin request crashed a node")
+	}
+	if c := do(srv.URL); c != http.StatusNoContent {
+		t.Fatalf("same-origin: %d", c)
+	}
+	r, _ := http.Post(srv.URL+"/api/network", "application/json", strings.NewReader(`{"minDelayMs":0,"maxDelayMs":9223372036854}`))
+	_ = r.Body.Close()
+	if r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("huge delay accepted: %d", r.StatusCode)
 	}
 }

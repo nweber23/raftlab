@@ -15,7 +15,7 @@ make test-chaos   # 100 seeds of the chaos test
 make lint
 ```
 
-Port 8080 busy? `make run ADDR=:9000`.
+Port 8080 busy? `make run ADDR=127.0.0.1:9000`.
 
 `make run` starts five nodes inside one process. Open the page and try the [demo scenarios](#demo-scenarios).
 

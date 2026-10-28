@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,7 +16,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address; the control API is unauthenticated, keep it on loopback")
 	size := flag.Int("nodes", 5, "cluster size")
 	data := flag.String("data", "", "WAL directory (default: a temp dir removed on exit)")
 	flag.Parse()
@@ -51,7 +52,10 @@ func run(addr string, size int, data string) error {
 		defer cancel()
 		_ = hs.Shutdown(shutdown)
 	}()
-	log.Printf("raftlab: %d nodes, visualizer on http://localhost%s", size, addr)
+	if host, _, err := net.SplitHostPort(addr); err != nil || (host != "127.0.0.1" && host != "localhost" && host != "::1") {
+		log.Printf("warning: %s is not loopback; anyone who can reach it can crash nodes and rewrite data", addr)
+	}
+	log.Printf("raftlab: %d nodes, visualizer on http://%s", size, addr)
 	if err := hs.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
