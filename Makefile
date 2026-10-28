@@ -1,8 +1,9 @@
 .PHONY: run build test test-chaos lint fmt
 
-# Serve the cluster visualizer on http://localhost:8080.
+# Serve the cluster visualizer on http://localhost:8080 (make run ADDR=:9000 to move it).
+ADDR ?= :8080
 run:
-	go run ./cmd/raftlab -addr :8080
+	go run ./cmd/raftlab -addr $(ADDR)
 
 build:
 	go build -o bin/ ./cmd/...
