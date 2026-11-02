@@ -16,8 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/nweber23/raftlab/internal/raft"
 )
@@ -241,22 +243,43 @@ func (w *WAL) SaveSnapshot(s raft.Snapshot, tail []raft.Entry) error {
 			return err
 		}
 	}
+	// Windows cannot rename a file that is open, nor replace one that is, so
+	// both handles are closed first. Until the rename the old file is intact.
+	if err := nf.Close(); err != nil {
+		return err
+	}
+	_ = w.f.Close() // about to be replaced; nothing more to flush
 	if err := os.Rename(tmp, w.path); err != nil {
-		_ = nf.Close()
+		w.reopen() // keep the old WAL usable
 		return err
 	}
 	if !w.opts.NoSync {
 		if err := syncDir(filepath.Dir(w.path)); err != nil {
-			_ = nf.Close()
+			w.reopen()
 			return err
 		}
 	}
-	_ = w.f.Close() // the old file is replaced; nothing more to flush
-	w.f = nf        // positioned at the end of the new file
+	return w.reopen()
+}
+
+// reopen reopens the file at path, positioned at its end, as the append handle.
+func (w *WAL) reopen() error {
+	f, err := os.OpenFile(w.path, os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		_ = f.Close()
+		return err
+	}
+	w.f = f
 	return nil
 }
 
 func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil // directories cannot be opened for sync there; NTFS journals the rename
+	}
 	d, err := os.Open(dir)
 	if err != nil {
 		return err
