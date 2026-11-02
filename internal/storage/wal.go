@@ -250,12 +250,12 @@ func (w *WAL) SaveSnapshot(s raft.Snapshot, tail []raft.Entry) error {
 	}
 	_ = w.f.Close() // about to be replaced; nothing more to flush
 	if err := os.Rename(tmp, w.path); err != nil {
-		w.reopen() // keep the old WAL usable
+		_ = w.reopen() // keep the old WAL usable; the rename error is the one to report
 		return err
 	}
 	if !w.opts.NoSync {
 		if err := syncDir(filepath.Dir(w.path)); err != nil {
-			w.reopen()
+			_ = w.reopen()
 			return err
 		}
 	}
