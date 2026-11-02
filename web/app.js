@@ -4,7 +4,7 @@
 const SVG = "http://www.w3.org/2000/svg";
 const CX = 320, CY = 260, R = 190, NODE_R = 44;
 const MIN_FLIGHT_MS = 450; // zero-latency messages would be invisible, so every packet gets at least this
-const TERM_COLORS = ["#7fb3ff", "#8fd694", "#f4b942", "#e58fd0", "#79d6d0", "#f08a7c", "#b9a4f5", "#c8d66f"];
+const TERM_COLORS = ["#8ec5ff", "#8fe3a6", "#ffd479", "#f3a6dc", "#7fe0d8", "#ff9f94", "#c3b5ff", "#d4e57f"];
 const termColor = (t) => TERM_COLORS[t % TERM_COLORS.length];
 const $ = (id) => document.getElementById(id);
 const el = (name, attrs = {}, parent) => {
@@ -35,7 +35,7 @@ function connect() {
 }
 function setConn(on) {
   const c = $("conn");
-  c.textContent = on ? "live" : "disconnected — retrying";
+  c.textContent = on ? "Live" : "Disconnected, retrying…";
   c.className = "pill " + (on ? "on" : "off");
 }
 
@@ -55,7 +55,7 @@ function layout(nodes) {
   for (const n of nodes) {
     const g = el("g", { class: "node follower", transform: `translate(${pos[n.id].x} ${pos[n.id].y})` }, nl);
     el("circle", { class: "body", r: NODE_R }, g);
-    const crown = el("text", { class: "crown", y: -NODE_R - 6 }, g); crown.textContent = "♛";
+    const crown = el("text", { class: "crown", y: -NODE_R - 6 }, g); crown.textContent = "Leader";
     const id = el("text", { class: "id", y: 7 }, g); id.textContent = "N" + n.id;
     const meta = el("text", { class: "meta", y: NODE_R + 16 }, g);
     const sub = el("text", { class: "meta", y: NODE_R + 30 }, g);
@@ -261,7 +261,7 @@ function diffEvents(a, b) {
     if (!o) continue;
     if (o.up && !n.up) note(`N${n.id} crashed`);
     else if (!o.up && n.up) note(`N${n.id} restarted from its log`);
-    else if (n.up && o.role !== n.role) note(`N${n.id} is now ${n.role} (term ${n.term})` + (n.role === "leader" ? " 👑" : ""));
+    else if (n.up && o.role !== n.role) note(`N${n.id} is now ${n.role} (term ${n.term})`);
     if (n.up && o.snapIndex !== n.snapIndex && n.snapIndex) note(`N${n.id} compacted its log through index ${n.snapIndex}`);
   }
 }

@@ -8,10 +8,12 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header>
-  <h1>raftlab</h1>
-  <span class="sub">live Raft cluster</span>
-  <span id="conn" class="pill off" role="status">connecting…</span>
+<header class="toolbar">
+  <div>
+    <h1>raftlab</h1>
+    <span class="sub">Live Raft cluster</span>
+    <span id="conn" class="pill off" role="status">Connecting…</span>
+  </div>
 </header>
 
 <main>
@@ -34,7 +36,7 @@
   <aside class="side">
     <section class="panel">
       <h2>Nodes</h2>
-      <p class="hint">Tick nodes to select them for a partition.</p>
+      <p class="hint">Select nodes to cut them off from the rest.</p>
       <ul id="nodelist" class="nodelist"></ul>
       <div class="row">
         <button id="btn-partition">Partition selected | rest</button>
@@ -73,7 +75,7 @@
 </main>
 
 <section class="panel wide">
-  <h2>Replicated logs <span class="hint">solid = committed, dashed = not yet committed, ▎= commit index</span></h2>
+  <h2>Replicated logs <span class="hint">Solid is committed, dashed is not yet committed, the green bar marks the commit index.</span></h2>
   <div id="logs"></div>
 </section>
 
