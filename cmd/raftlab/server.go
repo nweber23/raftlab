@@ -99,6 +99,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /ws", s.ws)
 	mux.HandleFunc("POST /api/crash", s.nodeAction(s.lab.Crash))
 	mux.HandleFunc("POST /api/restart", s.nodeAction(s.lab.Restart))
+	mux.HandleFunc("POST /api/resize", func(w http.ResponseWriter, r *http.Request) {
+		n, err := strconv.Atoi(r.URL.Query().Get("n"))
+		if err == nil {
+			err = s.lab.Resize(n)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("POST /api/partition", s.partition)
 	mux.HandleFunc("POST /api/heal", func(w http.ResponseWriter, _ *http.Request) {
 		s.lab.Heal()

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -34,28 +35,62 @@ type member struct {
 	api   http.Handler
 }
 
+// MaxNodes bounds Resize; the visualizer ring stays legible up to about this many.
+const MaxNodes = 15
+
 // NewLab boots size nodes whose WALs live under dir.
 func NewLab(size int, dir string) (*Lab, error) {
+	if size < 1 || size > MaxNodes {
+		return nil, fmt.Errorf("cluster size must be 1..%d", MaxNodes)
+	}
 	l := &Lab{
 		dir: dir, members: map[raft.NodeID]*member{},
 		net: transport.NewNetwork(clock.System{}, rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 1))),
 	}
-	for i := 1; i <= size; i++ {
+	if err := l.Resize(size); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// Resize replaces the cluster with a fresh one of n nodes.
+// ponytail: Raft here has static membership, so scaling wipes all state and
+// re-elects; live add/remove needs joint-consensus or single-server changes in internal/raft.
+func (l *Lab) Resize(n int) error {
+	if n < 1 || n > MaxNodes {
+		return fmt.Errorf("cluster size must be 1..%d", MaxNodes)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	old := l.ids
+	for _, id := range old {
+		_ = l.crash(id)
+		_ = os.RemoveAll(filepath.Join(l.dir, fmt.Sprint(id)))
+	}
+	l.net.Heal()
+	l.ids = nil
+	for i := 1; i <= n; i++ {
 		l.ids = append(l.ids, raft.NodeID(i))
 	}
 	for _, id := range l.ids {
-		if err := l.Restart(id); err != nil {
-			l.Close()
-			return nil, err
+		if err := l.start(id); err != nil {
+			for _, x := range l.ids {
+				_ = l.crash(x)
+			}
+			return err
 		}
 	}
-	return l, nil
+	return nil
 }
 
 // Restart boots node id from its WAL. It is a no-op if the node is up.
 func (l *Lab) Restart(id raft.NodeID) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.start(id)
+}
+
+func (l *Lab) start(id raft.NodeID) error {
 	if l.members[id] != nil {
 		return nil
 	}
@@ -103,6 +138,10 @@ func (l *Lab) known(id raft.NodeID) bool {
 func (l *Lab) Crash(id raft.NodeID) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.crash(id)
+}
+
+func (l *Lab) crash(id raft.NodeID) error {
 	if !l.known(id) {
 		return fmt.Errorf("no such node %d", id)
 	}
@@ -118,8 +157,10 @@ func (l *Lab) Crash(id raft.NodeID) error {
 
 // Close stops every node.
 func (l *Lab) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	for _, id := range l.ids {
-		_ = l.Crash(id)
+		_ = l.crash(id)
 	}
 }
 
@@ -193,12 +234,13 @@ func (l *Lab) State() State {
 		Drop: f.DropRate, Dup: f.DupRate,
 	}
 	l.mu.Lock()
+	ids := append([]raft.NodeID(nil), l.ids...)
 	members := make(map[raft.NodeID]*member, len(l.members))
 	for id, m := range l.members {
 		members[id] = m
 	}
 	l.mu.Unlock()
-	for _, id := range l.ids {
+	for _, id := range ids {
 		ns := NodeState{ID: id, Group: f.PartitionOf[id], Log: []LogEntry{}, KV: map[string]string{}}
 		if m := members[id]; m != nil {
 			s := m.node.Status()

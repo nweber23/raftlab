@@ -20,8 +20,8 @@
   <section class="panel stage-panel" aria-label="Cluster">
     <svg id="stage" viewBox="0 0 640 520" role="img" aria-label="Cluster topology with messages in flight">
       <g id="links"></g>
-      <g id="nodes"></g>
       <g id="msgs"></g>
+      <g id="nodes"></g>
     </svg>
     <ul class="legend" aria-label="Legend">
       <li><i style="background:var(--vote)"></i>RequestVote</li>
@@ -37,6 +37,12 @@
     <section class="panel">
       <h2>Nodes</h2>
       <p class="hint">Select nodes to cut them off from the rest.</p>
+      <form id="resize" class="row">
+        <label for="n">Cluster size</label>
+        <input id="n" type="number" min="1" max="15" value="5" style="width:4.5em">
+        <button type="submit">Scale</button>
+      </form>
+      <p class="hint">Scaling restarts the cluster with fresh state.</p>
       <ul id="nodelist" class="nodelist"></ul>
       <div class="row">
         <button id="btn-partition">Partition selected | rest</button>

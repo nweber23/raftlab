@@ -251,3 +251,16 @@ func TestLoopbackOnlyRejectsForeignHost(t *testing.T) {
 		}
 	}
 }
+
+func TestResize(t *testing.T) {
+	lab := newTestLab(t)
+	for _, n := range []int{7, 1, 4} {
+		if err := lab.Resize(n); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "leader after resize", func() bool { return len(lab.State().Nodes) == n && leaderOf(lab, 0) != 0 })
+	}
+	if lab.Resize(0) == nil || lab.Resize(MaxNodes+1) == nil {
+		t.Fatal("out-of-range size accepted")
+	}
+}

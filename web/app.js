@@ -2,7 +2,7 @@
 
 // --- constants & helpers -----------------------------------------------------
 const SVG = "http://www.w3.org/2000/svg";
-const CX = 320, CY = 260, R = 190, NODE_R = 44;
+let CX = 320, CY = 260, R = 190, NODE_R = 44, DENSE = false;
 const MIN_FLIGHT_MS = 450; // zero-latency messages would be invisible, so every packet gets at least this
 const TERM_COLORS = ["#8ec5ff", "#8fe3a6", "#ffd479", "#f3a6dc", "#7fe0d8", "#ff9f94", "#c3b5ff", "#d4e57f"];
 const termColor = (t) => TERM_COLORS[t % TERM_COLORS.length];
@@ -41,6 +41,19 @@ function setConn(on) {
 
 // --- stage ------------------------------------------------------------------
 function layout(nodes) {
+  const n = nodes.length;
+  DENSE = n > 8;
+  R = 190 + Math.max(0, n - 8) * 14;   // ring grows with the cluster so nodes never touch
+  NODE_R = Math.min(44, 0.4 * 2 * R * Math.sin(Math.PI / Math.max(n, 2)));
+  const H = Math.max(520, 2 * (R + NODE_R + 45)), W = Math.max(640, H);
+  CX = W / 2; CY = H / 2;
+  $("stage").setAttribute("viewBox", `0 0 ${W} ${H}`);
+  $("stage").classList.toggle("dense", DENSE);
+  for (const id of ["links", "nodes", "msgs", "nodelist", "logs"]) $(id).textContent = "";
+  $("target").length = 1;
+  selected.clear(); flying.length = 0;
+  for (const k of Object.keys(pos)) delete pos[k];
+  for (const k of Object.keys(nodeEls)) delete nodeEls[k];
   nodes.forEach((n, i) => {
     const a = -Math.PI / 2 + (2 * Math.PI * i) / nodes.length;
     pos[n.id] = { x: CX + R * Math.cos(a), y: CY + R * Math.sin(a) };
@@ -95,7 +108,7 @@ function msgColor(m) {
 }
 function onMsg(m) {
   if (!pos[m.from] || !pos[m.to] || document.hidden) return;
-  const c = el("circle", { class: "msg", r: m.kind.startsWith("Append") && m.detail.includes("entries=0") ? 4 : 6, fill: msgColor(m) }, $("msgs"));
+  const c = el("circle", { class: "msg", r: m.kind.startsWith("Append") && m.detail.includes("entries=0") ? 3 : DENSE ? 4 : 6, fill: msgColor(m) }, $("msgs"));
   const t = el("title", {}, c);
   t.textContent = `${m.kind} N${m.from}→N${m.to} (term ${m.term}) ${m.detail}` + (m.dropped ? ` — dropped: ${m.reason}` : "") + (m.dup ? " [duplicate]" : "");
   flying.push({ m, c, start: performance.now(), dur: m.delayMs + MIN_FLIGHT_MS });
@@ -202,6 +215,7 @@ $("btn-isolate-leader").onclick = () => {
   post("/api/partition", { groups: [[l.id]] });
   note(`partition: leader N${l.id} isolated`);
 };
+$("resize").onsubmit = (e) => { e.preventDefault(); post("/api/resize?n=" + $("n").value); };
 $("btn-heal").onclick = () => { post("/api/heal"); note("partitions healed"); };
 
 let netTimer;
@@ -268,7 +282,11 @@ function diffEvents(a, b) {
 
 // --- state ------------------------------------------------------------------
 function onState(s) {
-  if (!state) { layout(s.nodes); syncNet(s); note("connected"); }
+  if (!state) { syncNet(s); note("connected"); }
+  if (!state || state.nodes.length !== s.nodes.length) {
+    if (state) note(`cluster scaled to ${s.nodes.length} nodes`);
+    layout(s.nodes); state = null; $("n").value = s.nodes.length;
+  }
   diffEvents(state, s);
   prev = state; state = s;
   renderStage(s); renderNodeList(s); renderLogs(s);

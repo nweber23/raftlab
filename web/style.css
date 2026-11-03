@@ -71,6 +71,9 @@ h2 .hint { margin-top: 0; }
 .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
 
 .link { stroke: var(--line); stroke-width: 1.5; }
+.dense .link { opacity: .45; }
+.dense .node .meta { display: none; }
+.dense .node .id { font-size: 18px; }
 .link.cut { stroke: var(--no); stroke-dasharray: 3 6; stroke-linecap: round; opacity: .7; }
 .node circle.body { stroke-width: 2.5; transition: fill .25s, stroke .25s; }
 .node.follower circle.body  { fill: color-mix(in srgb, var(--follower) 12%, var(--panel));  stroke: var(--follower); }
