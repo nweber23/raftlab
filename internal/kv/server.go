@@ -18,6 +18,8 @@ import (
 //	PUT    /kv/{key}   body = value
 //	GET    /kv/{key}
 //	DELETE /kv/{key}
+//	POST   /session    register: the body of the reply is a new client ID
+//	POST   /keepalive  refresh the session named by X-Client-ID
 //	GET    /status
 //
 // Writes carry X-Client-ID and X-Request-ID (a per-client increasing number);
@@ -39,6 +41,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /kv/{key}", s.serveKV(OpGet))
 	mux.HandleFunc("PUT /kv/{key}", s.serveKV(OpSet))
 	mux.HandleFunc("DELETE /kv/{key}", s.serveKV(OpDelete))
+	mux.HandleFunc("POST /session", s.serveKV(OpRegister))
+	mux.HandleFunc("POST /keepalive", s.serveKV(OpKeepAlive))
 	mux.HandleFunc("GET /status", s.status)
 	return mux
 }
@@ -62,8 +66,13 @@ func (s *Server) serveKV(kind string) http.HandlerFunc {
 			}
 			op.Value = string(body)
 		}
-		if op.Client == "" { // untracked request: unique ID, so no dedup across retries
-			op.Client, op.Seq = fmt.Sprintf("anon-%x", rand.Uint64()), 1
+		if kind == OpRegister || kind == OpGet || (op.Client == "" && !s.Store.RequireSessions) {
+			// untracked request: no session, no dedup across retries. The waiter
+			// still needs a unique key.
+			op.Anon, op.Client, op.Seq = true, fmt.Sprintf("anon-%x", rand.Uint64()), 1
+		} else if op.Client == "" {
+			http.Error(w, "this cluster requires a session: POST /session, then send X-Client-ID", http.StatusUnauthorized)
+			return
 		} else if h := r.Header.Get("X-Request-ID"); h != "" {
 			seq, err := strconv.ParseUint(h, 10, 64)
 			if err != nil {
@@ -116,8 +125,12 @@ func (s *Server) serveKV(kind string) http.HandlerFunc {
 		}
 		res := p.Result()
 		switch {
+		case res.Expired:
+			http.Error(w, res.Err, http.StatusUnauthorized)
 		case res.Err != "":
 			http.Error(w, res.Err, http.StatusConflict)
+		case kind == OpRegister:
+			_, _ = io.WriteString(w, res.Value)
 		case kind == OpGet && !res.Found:
 			http.Error(w, "not found", http.StatusNotFound)
 		case kind == OpGet:

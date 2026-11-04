@@ -16,7 +16,7 @@ import (
 )
 
 // httpCluster runs three real-clock nodes with an httptest server each.
-func httpCluster(t *testing.T) (urls map[raft.NodeID]string, nodes map[raft.NodeID]*raft.Node) {
+func httpCluster(t *testing.T, tune ...func(*kv.Store)) (urls map[raft.NodeID]string, nodes map[raft.NodeID]*raft.Node) {
 	t.Helper()
 	net := transport.NewNetwork(clock.System{}, rand.New(rand.NewPCG(1, 1)))
 	ids := []raft.NodeID{1, 2, 3}
@@ -28,6 +28,9 @@ func httpCluster(t *testing.T) (urls map[raft.NodeID]string, nodes map[raft.Node
 	built := map[raft.NodeID]pair{}
 	for _, id := range ids {
 		s := kv.New()
+		for _, f := range tune {
+			f(s)
+		}
 		n, err := raft.New(raft.Config{
 			ID: id, Peers: ids, Clock: clock.System{}, Transport: net, Machine: s,
 			ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,

@@ -6,10 +6,16 @@
 //
 // If $RAFTLAB_TOKEN is set, peers must present it on /raft. It is read from
 // the environment only, so it never appears in the process list.
+//
+// With -tls-ca, -tls-cert and -tls-key the node serves HTTPS and peers
+// authenticate each other with certificates (see cmd/raftcert): /raft accepts
+// a message only from a peer whose verified certificate is named for the
+// sender. The key-value API is then HTTPS too, but needs no client certificate.
 package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -25,6 +31,7 @@ import (
 
 	"github.com/nweber23/raftlab/internal/clock"
 	"github.com/nweber23/raftlab/internal/kv"
+	"github.com/nweber23/raftlab/internal/pki"
 	"github.com/nweber23/raftlab/internal/raft"
 	"github.com/nweber23/raftlab/internal/storage"
 	"github.com/nweber23/raftlab/internal/transport"
@@ -35,9 +42,15 @@ func main() {
 	peerList := flag.String("peers", "", "comma-separated id=host:port for every node, this one included")
 	data := flag.String("data", "data", "directory for the write-ahead log (a subdirectory per node ID)")
 	snap := flag.Int("snapshot-threshold", 1000, "compact the log after this many applied entries (0 = never)")
+	ttl := flag.Duration("session-ttl", 0, "forget client sessions idle this long (0 = never)")
+	require := flag.Bool("require-sessions", false, "reject writes whose X-Client-ID was not issued by POST /session")
+	var tf tlsFiles
+	flag.StringVar(&tf.ca, "tls-ca", "", "CA certificate (PEM) that signs every node's certificate; enables mutual TLS")
+	flag.StringVar(&tf.cert, "tls-cert", "", "this node's certificate (PEM), named raftlab-node-<id>")
+	flag.StringVar(&tf.key, "tls-key", "", "this node's private key (PEM)")
 	flag.Parse()
 
-	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), os.Getenv("RAFTLAB_TOKEN"), *snap); err != nil {
+	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), os.Getenv("RAFTLAB_TOKEN"), *snap, tf, kv.SessionOptions{TTL: *ttl, Require: *require}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -55,7 +68,7 @@ func parsePeers(s string) (map[raft.NodeID]string, error) {
 	return peers, nil
 }
 
-func run(id raft.NodeID, peerList, dir, token string, snapThreshold int) error {
+func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsFiles, sessions kv.SessionOptions) error {
 	addrs, err := parsePeers(peerList)
 	if err != nil {
 		return err
@@ -64,12 +77,25 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int) error {
 	if !ok {
 		return errors.New("-id must appear in -peers")
 	}
+	var serverTLS *tls.Config
+	var dialOpts []transport.HTTPOption
+	var peerCert []transport.HandlerOption
+	scheme := "http://"
+	if tf.enabled() {
+		var clientTLS *tls.Config
+		if serverTLS, clientTLS, err = tf.configs(); err != nil {
+			return err
+		}
+		dialOpts = append(dialOpts, transport.WithTLS(clientTLS))
+		peerCert = append(peerCert, transport.RequirePeerCert(pki.NodeName))
+		scheme = "https://"
+	}
 	var ids []raft.NodeID
 	urls := map[raft.NodeID]string{}
 	others := map[raft.NodeID]string{}
 	for p, a := range addrs {
 		ids = append(ids, p)
-		urls[p] = "http://" + a
+		urls[p] = scheme + a
 		if p != id {
 			others[p] = urls[p]
 		}
@@ -80,9 +106,10 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int) error {
 		return err
 	}
 	defer func() { _ = wal.Close() }()
-	tr := transport.NewHTTP(others, token)
+	tr := transport.NewHTTP(others, token, dialOpts...)
 	defer tr.Close()
 	store := kv.New()
+	store.SessionTTL, store.RequireSessions = sessions.TTL, sessions.Require
 	node, err := raft.New(raft.Config{
 		ID: id, Peers: ids, Initial: initial, Storage: wal, Machine: store,
 		Clock: clock.System{}, Transport: tr, SnapshotThreshold: snapThreshold, PreVote: true, CheckQuorum: true,
@@ -96,15 +123,21 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int) error {
 	store.Attach(node)
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /raft", transport.Handler(id, ids, token, node.Handle))
+	mux.Handle("POST /raft", transport.Handler(id, ids, token, node.Handle, peerCert...))
 	api := &kv.Server{Store: store, Node: node, LeaderURL: func(l raft.NodeID) string { return urls[l] }}
 	mux.Handle("/", api.Handler())
-	srv := &http.Server{Addr: self, Handler: mux}
+	srv := &http.Server{Addr: self, Handler: mux, TLSConfig: serverTLS}
 
 	node.Start()
 	defer node.Stop()
 	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe() }()
+	go func() {
+		if serverTLS != nil {
+			errc <- srv.ListenAndServeTLS("", "") // certificates come from TLSConfig
+		} else {
+			errc <- srv.ListenAndServe()
+		}
+	}()
 	log.Printf("node %d listening on %s, data in %s", id, self, dir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

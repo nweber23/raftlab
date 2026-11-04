@@ -26,6 +26,13 @@ type fakeTimer struct {
 	armed bool // armed timers, and only they, are in FakeClock.timers
 }
 
+// Now is the virtual time elapsed since the clock was created.
+func (c *FakeClock) Now() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
 // NewFakeClock starts at t=0.
 func NewFakeClock() *FakeClock { return &FakeClock{} }
 
