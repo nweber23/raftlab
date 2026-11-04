@@ -147,3 +147,27 @@ func TestImpossibleTruncationIsAnError(t *testing.T) {
 		t.Fatal("want error for checksum-valid but impossible record")
 	}
 }
+
+func TestConfigEntriesAndSnapshotMembershipRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	w, _ := mustOpen(t, dir)
+	conf := raft.Entry{Term: 2, Kind: raft.EntryConfig, Command: []byte(`{"voters":[1,2,3],"old":[1,2]}`)}
+	if err := w.Append(0, []raft.Entry{e(1, "a"), conf}); err != nil {
+		t.Fatal(err)
+	}
+	snapConf := raft.Membership{Voters: []raft.NodeID{1, 2, 4}, Old: []raft.NodeID{1, 2, 3}}
+	if err := w.SaveSnapshot(raft.Snapshot{Index: 2, Term: 2, Config: snapConf, Data: []byte("img")}, []raft.Entry{conf}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w, st := mustOpen(t, dir)
+	defer w.Close()
+	if st.SnapIndex != 2 || string(st.SnapData) != "img" || !reflect.DeepEqual(st.SnapConf, snapConf) {
+		t.Fatalf("snapshot: %+v", st)
+	}
+	if len(st.Log) != 1 || st.Log[0].Kind != raft.EntryConfig || string(st.Log[0].Command) != string(conf.Command) {
+		t.Fatalf("log: %+v", st.Log)
+	}
+}

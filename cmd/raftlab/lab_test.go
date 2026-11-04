@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -254,12 +256,39 @@ func TestLoopbackOnlyRejectsForeignHost(t *testing.T) {
 
 func TestResize(t *testing.T) {
 	lab := newTestLab(t)
+	srv := httptest.NewServer(NewServer(lab).Handler())
+	defer srv.Close()
+	put := func(key string) {
+		t.Helper()
+		waitFor(t, "a leader", func() bool { return leaderOf(lab, 0) != 0 })
+		req, _ := http.NewRequest("PUT", srv.URL+"/node/"+strconv.Itoa(int(leaderOf(lab, 0)))+"/kv/"+key, strings.NewReader("v"))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("PUT %s: %d", key, resp.StatusCode)
+		}
+	}
+	put("before")
 	for _, n := range []int{7, 1, 4} {
 		if err := lab.Resize(n); err != nil {
 			t.Fatal(err)
 		}
-		waitFor(t, "leader after resize", func() bool { return len(lab.State().Nodes) == n && leaderOf(lab, 0) != 0 })
+		if got := len(lab.State().Nodes); got != n {
+			t.Fatalf("resize to %d left %d nodes", n, got)
+		}
+		put(fmt.Sprint("after-", n)) // still writable, and nothing was reset
 	}
+	waitFor(t, "every survivor to hold all the data", func() bool {
+		for _, n := range lab.State().Nodes {
+			if n.KV["before"] != "v" || n.KV["after-7"] != "v" || n.KV["after-1"] != "v" || n.KV["after-4"] != "v" {
+				return false
+			}
+		}
+		return true
+	})
 	if lab.Resize(0) == nil || lab.Resize(MaxNodes+1) == nil {
 		t.Fatal("out-of-range size accepted")
 	}

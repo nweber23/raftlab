@@ -85,11 +85,12 @@ type Cluster struct {
 	Opts  Options
 	Clock *FakeClock
 	Net   *transport.Network
-	IDs   []raft.NodeID
+	IDs   []raft.NodeID // every node ever booted, including ones since removed
 	Nodes map[raft.NodeID]*raft.Node
 	SMs   map[raft.NodeID]raft.StateMachine
 	WALs  map[raft.NodeID]*storage.WAL
 
+	initial  []raft.NodeID // the founding members; later nodes join with no Peers
 	dir      string
 	restarts map[raft.NodeID]uint64
 
@@ -109,10 +110,25 @@ func NewCluster(t testing.TB, o Options) *Cluster {
 	for i := 1; i <= o.Size; i++ {
 		c.IDs = append(c.IDs, raft.NodeID(i))
 	}
+	c.initial = append([]raft.NodeID(nil), c.IDs...)
 	for _, id := range c.IDs {
 		c.boot(id)
 	}
 	return c
+}
+
+// AddNode boots a new server that knows no peers; it stays passive until a
+// leader replicates a configuration to it (see Node.ChangeMembership).
+func (c *Cluster) AddNode(id raft.NodeID) {
+	c.IDs = append(c.IDs, id)
+	c.boot(id)
+}
+
+func (c *Cluster) peersFor(id raft.NodeID) []raft.NodeID {
+	if slices.Contains(c.initial, id) {
+		return c.initial
+	}
+	return nil
 }
 
 // boot creates and starts node id from scratch.
@@ -128,7 +144,7 @@ func (c *Cluster) boot(id raft.NodeID) {
 	}
 	c.WALs[id] = wal
 	n, err := raft.New(raft.Config{
-		ID: id, Peers: c.IDs, Initial: initial, Storage: wal,
+		ID: id, Peers: c.peersFor(id), Initial: initial, Storage: wal,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
 		PreVote:           !c.Opts.Classic, CheckQuorum: !c.Opts.Classic,

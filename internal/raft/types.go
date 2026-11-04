@@ -34,9 +34,21 @@ func (r Role) String() string {
 	return "unknown"
 }
 
+// EntryKind says how an Entry is interpreted.
+type EntryKind uint8
+
+const (
+	// EntryCommand is an opaque application command (empty for a leader no-op).
+	EntryCommand EntryKind = iota
+	// EntryConfig carries a JSON-encoded Membership. A node uses the newest config
+	// entry in its log as soon as it is appended, committed or not (§6).
+	EntryConfig
+)
+
 // Entry is one log entry. Its index is its position in the log, starting at 1.
 type Entry struct {
 	Term    uint64
+	Kind    EntryKind
 	Command []byte
 }
 
@@ -97,6 +109,7 @@ type InstallSnapshotArgs struct {
 	LeaderID          NodeID
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
+	Config            Membership // membership as of LastIncludedIndex
 	Data              []byte
 }
 
@@ -123,6 +136,7 @@ type PersistentState struct {
 
 	SnapIndex uint64 // last log index covered by the snapshot, 0 if none
 	SnapTerm  uint64
+	SnapConf  Membership // membership as of SnapIndex
 	SnapData  []byte
 }
 
@@ -137,8 +151,10 @@ type Status struct {
 	CommitIndex uint64
 	LastApplied uint64
 	LastIndex   uint64
-	SnapIndex   uint64  // log entries up to here are compacted into the snapshot
-	Log         []Entry // copy of the in-memory log; Log[0] has index LastIndex-len(Log)+1
+	SnapIndex   uint64     // log entries up to here are compacted into the snapshot
+	Config      Membership // membership this node currently acts on
+	ConfigIndex uint64     // log index of the entry that set it; 0 if it predates the log
+	Log         []Entry    // copy of the in-memory log; Log[0] has index LastIndex-len(Log)+1
 }
 
 // Kind names the RPC carried by m, for logs and the visualizer.

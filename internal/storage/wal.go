@@ -13,6 +13,7 @@ package storage
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -26,8 +27,8 @@ import (
 
 const (
 	recState    byte = 1 // term u64, votedFor u32
-	recAppend   byte = 2 // after u64, count u32, entries (term u64, len u32, bytes)
-	recSnapshot byte = 3 // index u64, term u64, data
+	recAppend   byte = 2 // after u64, count u32, entries (term u64, kind u8, len u32, bytes)
+	recSnapshot byte = 3 // index u64, term u64, conf len u32, conf JSON, data
 
 	headerSize = 8
 	maxRecord  = 1 << 30 // sanity bound so a corrupt length cannot trigger a huge allocation
@@ -134,25 +135,30 @@ func apply(st *raft.PersistentState, typ byte, p []byte) error {
 		}
 		st.Log = st.Log[:after-st.SnapIndex]
 		for i := 0; i < count; i++ {
-			if len(p) < 12 {
+			if len(p) < 13 {
 				return bad()
 			}
 			term := binary.LittleEndian.Uint64(p)
-			l := int(binary.LittleEndian.Uint32(p[8:]))
-			p = p[12:]
+			kind := raft.EntryKind(p[8])
+			l := int(binary.LittleEndian.Uint32(p[9:]))
+			p = p[13:]
 			if len(p) < l {
 				return bad()
 			}
-			st.Log = append(st.Log, raft.Entry{Term: term, Command: append([]byte(nil), p[:l]...)})
+			st.Log = append(st.Log, raft.Entry{Term: term, Kind: kind, Command: append([]byte(nil), p[:l]...)})
 			p = p[l:]
 		}
 	case recSnapshot:
-		if len(p) < 16 {
+		if len(p) < 20 {
 			return bad()
 		}
 		st.SnapIndex = binary.LittleEndian.Uint64(p)
 		st.SnapTerm = binary.LittleEndian.Uint64(p[8:])
-		st.SnapData = append([]byte(nil), p[16:]...)
+		cl := int(binary.LittleEndian.Uint32(p[16:]))
+		if len(p)-20 < cl || json.Unmarshal(p[20:20+cl], &st.SnapConf) != nil {
+			return bad()
+		}
+		st.SnapData = append([]byte(nil), p[20+cl:]...)
 		st.Log = nil // a snapshot record is always followed by the tail's append record
 	default:
 		return fmt.Errorf("unknown record type %d", typ)
@@ -182,6 +188,7 @@ func appendRecord(after uint64, entries []raft.Entry) []byte {
 	binary.LittleEndian.PutUint32(p[8:], uint32(len(entries)))
 	for _, e := range entries {
 		p = binary.LittleEndian.AppendUint64(p, e.Term)
+		p = append(p, byte(e.Kind))
 		p = binary.LittleEndian.AppendUint32(p, uint32(len(e.Command)))
 		p = append(p, e.Command...)
 	}
@@ -189,10 +196,12 @@ func appendRecord(after uint64, entries []raft.Entry) []byte {
 }
 
 func snapshotRecord(s raft.Snapshot) []byte {
-	p := make([]byte, 16, 16+len(s.Data))
+	conf, _ := json.Marshal(s.Config) // cannot fail: integers only
+	p := make([]byte, 20, 20+len(conf)+len(s.Data))
 	binary.LittleEndian.PutUint64(p, s.Index)
 	binary.LittleEndian.PutUint64(p[8:], s.Term)
-	return record(recSnapshot, append(p, s.Data...))
+	binary.LittleEndian.PutUint32(p[16:], uint32(len(conf)))
+	return record(recSnapshot, append(append(p, conf...), s.Data...))
 }
 
 func (w *WAL) sync() error {

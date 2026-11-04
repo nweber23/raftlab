@@ -3,14 +3,18 @@ package raft
 import (
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 )
 
 // Config holds everything a Node needs. Nothing in it is a global.
 type Config struct {
-	ID    NodeID
-	Peers []NodeID // every cluster member, including ID
+	ID NodeID
+	// Peers is the initial membership, used until the log or a snapshot says
+	// otherwise. A server joining an existing cluster leaves it empty: it
+	// stays passive until the leader replicates a configuration to it.
+	Peers []NodeID
 
 	ElectionTimeoutMin time.Duration // paper §5.2 suggests 150ms
 	ElectionTimeoutMax time.Duration // paper §5.2 suggests 300ms
@@ -52,6 +56,11 @@ type Node struct {
 	snapIndex   uint64  // last index covered by the snapshot
 	snapTerm    uint64
 	snapData    []byte
+	snapConf    Membership // membership as of snapIndex
+
+	// Active membership: the newest config entry in the log (or snapConf).
+	conf      Membership
+	confIndex uint64 // index of that entry, 0 if it comes from the snapshot or bootstrap
 
 	// Volatile state.
 	role        Role
@@ -89,12 +98,8 @@ func New(cfg Config) (*Node, error) {
 	case cfg.HeartbeatInterval <= 0 || cfg.HeartbeatInterval >= cfg.ElectionTimeoutMin:
 		return nil, errors.New("raft: HeartbeatInterval must be in (0, ElectionTimeoutMin)")
 	}
-	self := false
-	for _, p := range cfg.Peers {
-		self = self || p == cfg.ID
-	}
-	if !self {
-		return nil, errors.New("raft: Peers must include ID")
+	if len(cfg.Peers) > 0 && !slices.Contains(cfg.Peers, cfg.ID) {
+		return nil, errors.New("raft: Peers must include ID (or be empty for a joining server)")
 	}
 	if cfg.Machine == nil {
 		cfg.Machine = noopMachine{}
@@ -106,7 +111,12 @@ func New(cfg Config) (*Node, error) {
 		log:         append([]Entry(nil), cfg.Initial.Log...),
 		snapIndex:   cfg.Initial.SnapIndex, snapTerm: cfg.Initial.SnapTerm, snapData: cfg.Initial.SnapData,
 		commitIndex: cfg.Initial.SnapIndex, lastApplied: cfg.Initial.SnapIndex,
+		snapConf: cfg.Initial.SnapConf,
 	}
+	if n.snapConf.Voters == nil { // nothing durable yet: bootstrap from Peers
+		n.snapConf = Membership{Voters: normalize(cfg.Peers)}
+	}
+	n.refreshConfig()
 	if n.snapIndex > 0 {
 		cfg.Machine.Restore(n.snapData)
 	}
@@ -137,7 +147,7 @@ func (n *Node) Status() Status {
 	return Status{
 		ID: n.cfg.ID, Role: n.role, Term: n.currentTerm, VotedFor: n.votedFor,
 		Leader: n.leader, CommitIndex: n.commitIndex, LastApplied: n.lastApplied,
-		LastIndex: n.lastIndex(), SnapIndex: n.snapIndex, Log: append([]Entry(nil), n.log...),
+		LastIndex: n.lastIndex(), SnapIndex: n.snapIndex, Config: n.conf, ConfigIndex: n.confIndex, Log: append([]Entry(nil), n.log...),
 	}
 }
 
@@ -233,18 +243,9 @@ func (n *Node) stopHeartbeatTimer() {
 	n.heartbeatGen++
 }
 
-func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
-
-// hasQuorum reports whether the nodes for which ok is true form a majority.
-func (n *Node) hasQuorum(ok func(NodeID) bool) bool {
-	c := 0
-	for _, p := range n.cfg.Peers {
-		if ok(p) {
-			c++
-		}
-	}
-	return c >= n.majority()
-}
+// hasQuorum reports whether the nodes for which ok is true form a quorum of
+// the active configuration (both halves of it while a change is in flight).
+func (n *Node) hasQuorum(ok func(NodeID) bool) bool { return n.conf.Quorum(ok) }
 
 // --- election ---------------------------------------------------------------
 
@@ -262,7 +263,10 @@ func (n *Node) onElectionTimeout(gen uint64) {
 		return
 	}
 	n.leaderLive = false
-	if n.cfg.PreVote && len(n.cfg.Peers) > 1 {
+	if !n.conf.Has(n.cfg.ID) {
+		return // not a voter (new, or removed): wait for a leader to adopt us
+	}
+	if n.cfg.PreVote && len(n.peers()) > 0 {
 		n.startPreVote()
 		return
 	}
@@ -314,10 +318,8 @@ func (n *Node) startPreVote() {
 	n.preVoting, n.votes = true, map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer() // if the probe fails, probe again later
 	li, lt := n.lastLog()
-	for _, p := range n.cfg.Peers {
-		if p != n.cfg.ID {
-			n.send(p, RequestVoteArgs{Term: n.currentTerm + 1, CandidateID: n.cfg.ID, LastLogIndex: li, LastLogTerm: lt, PreVote: true})
-		}
+	for _, p := range n.peers() {
+		n.send(p, RequestVoteArgs{Term: n.currentTerm + 1, CandidateID: n.cfg.ID, LastLogIndex: li, LastLogTerm: lt, PreVote: true})
 	}
 }
 
@@ -334,10 +336,8 @@ func (n *Node) startElection() {
 		return
 	}
 	li, lt := n.lastLog()
-	for _, p := range n.cfg.Peers {
-		if p != n.cfg.ID {
-			n.send(p, RequestVoteArgs{Term: n.currentTerm, CandidateID: n.cfg.ID, LastLogIndex: li, LastLogTerm: lt})
-		}
+	for _, p := range n.peers() {
+		n.send(p, RequestVoteArgs{Term: n.currentTerm, CandidateID: n.cfg.ID, LastLogIndex: li, LastLogTerm: lt})
 	}
 }
 
@@ -350,11 +350,9 @@ func (n *Node) becomeLeader() {
 		n.active = map[NodeID]bool{}
 		n.armQuorumTimer()
 	}
-	n.nextIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
-	n.matchIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
-	for _, p := range n.cfg.Peers {
-		n.nextIndex[p] = n.lastIndex() + 1
-	}
+	n.nextIndex = map[NodeID]uint64{}
+	n.matchIndex = map[NodeID]uint64{}
+	n.syncProgress()
 	n.appendLocal(nil)
 	n.broadcastHeartbeat()
 }
@@ -387,10 +385,8 @@ const maxBatch = 64 // entries per AppendEntries
 // broadcastHeartbeat replicates to every peer (an empty AppendEntries when
 // the peer is caught up) and re-arms the heartbeat timer.
 func (n *Node) broadcastHeartbeat() {
-	for _, p := range n.cfg.Peers {
-		if p != n.cfg.ID {
-			n.sendAppend(p)
-		}
+	for _, p := range n.peers() {
+		n.sendAppend(p)
 	}
 	n.resetHeartbeatTimer()
 }
@@ -404,7 +400,7 @@ func (n *Node) sendAppend(p NodeID) {
 	if next <= n.snapIndex { // the entries it needs are compacted away
 		n.send(p, InstallSnapshotArgs{
 			Term: n.currentTerm, LeaderID: n.cfg.ID,
-			LastIncludedIndex: n.snapIndex, LastIncludedTerm: n.snapTerm, Data: n.snapData,
+			LastIncludedIndex: n.snapIndex, LastIncludedTerm: n.snapTerm, Config: n.snapConf, Data: n.snapData,
 		})
 		return
 	}
@@ -431,13 +427,7 @@ func (n *Node) advanceCommit() {
 		if n.termAt(i) != n.currentTerm {
 			break // older terms commit only indirectly
 		}
-		count := 0
-		for _, p := range n.cfg.Peers {
-			if n.matchIndex[p] >= i {
-				count++
-			}
-		}
-		if count >= n.majority() {
+		if n.hasQuorum(func(p NodeID) bool { return n.matchIndex[p] >= i }) {
 			n.commitIndex = i
 			n.applyCommitted()
 			return
@@ -450,25 +440,27 @@ func (n *Node) advanceCommit() {
 func (n *Node) applyCommitted() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		if e := n.log[n.lastApplied-n.snapIndex-1]; len(e.Command) > 0 {
+		if e := n.log[n.lastApplied-n.snapIndex-1]; e.Kind == EntryCommand && len(e.Command) > 0 {
 			n.cfg.Machine.Apply(n.lastApplied, e.Command)
 		}
 	}
 	if t := n.cfg.SnapshotThreshold; t > 0 && n.lastApplied-n.snapIndex >= uint64(t) {
 		n.compact()
 	}
+	n.afterCommit()
 }
 
 // compact snapshots the state machine at lastApplied and drops the log prefix
 // it covers (§7). Only applied (hence committed) entries are ever discarded.
 func (n *Node) compact() {
 	idx := n.lastApplied
-	snap := Snapshot{Index: idx, Term: n.termAt(idx), Data: n.cfg.Machine.Snapshot()}
+	conf, _ := n.configAt(idx)
+	snap := Snapshot{Index: idx, Term: n.termAt(idx), Config: conf, Data: n.cfg.Machine.Snapshot()}
 	tail := append([]Entry(nil), n.entries(idx, n.lastIndex())...)
 	if n.cfg.Storage != nil {
 		must(n.cfg.Storage.SaveSnapshot(snap, tail))
 	}
-	n.snapIndex, n.snapTerm, n.snapData, n.log = snap.Index, snap.Term, snap.Data, tail
+	n.snapIndex, n.snapTerm, n.snapData, n.snapConf, n.log = snap.Index, snap.Term, snap.Data, snap.Config, tail
 }
 
 // persistAppend makes "log truncated to after, then entries appended" durable.
@@ -616,6 +608,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 		}
 		n.log = append(n.log, a.Entries[i:]...)
 		n.persistAppend(idx-1, a.Entries[i:])
+		n.refreshConfig() // the suffix may have dropped or added a config entry
 		break
 	}
 
@@ -686,11 +679,12 @@ func (n *Node) handleInstallSnapshot(from NodeID, a InstallSnapshotArgs) {
 	if a.LastIncludedIndex <= n.lastIndex() && n.termAt(a.LastIncludedIndex) == a.LastIncludedTerm {
 		tail = append(tail, n.entries(a.LastIncludedIndex, n.lastIndex())...)
 	}
-	snap := Snapshot{Index: a.LastIncludedIndex, Term: a.LastIncludedTerm, Data: a.Data}
+	snap := Snapshot{Index: a.LastIncludedIndex, Term: a.LastIncludedTerm, Config: a.Config, Data: a.Data}
 	if n.cfg.Storage != nil {
 		must(n.cfg.Storage.SaveSnapshot(snap, tail))
 	}
-	n.snapIndex, n.snapTerm, n.snapData, n.log = snap.Index, snap.Term, snap.Data, tail
+	n.snapIndex, n.snapTerm, n.snapData, n.snapConf, n.log = snap.Index, snap.Term, snap.Data, snap.Config, tail
+	n.refreshConfig()
 	n.commitIndex, n.lastApplied = snap.Index, snap.Index
 	n.cfg.Machine.Restore(snap.Data)
 	n.send(from, InstallSnapshotReply{Term: n.currentTerm, MatchIndex: snap.Index})

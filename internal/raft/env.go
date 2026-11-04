@@ -42,6 +42,7 @@ func (noopMachine) Restore([]byte)       {}
 // Snapshot is a state-machine image covering the log up to and including Index.
 type Snapshot struct {
 	Index, Term uint64
+	Config      Membership // membership as of Index
 	Data        []byte
 }
 

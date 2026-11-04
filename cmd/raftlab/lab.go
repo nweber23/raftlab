@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,9 +25,12 @@ type Lab struct {
 	ids []raft.NodeID
 	net *transport.Network
 
-	mu      sync.Mutex
-	members map[raft.NodeID]*member // absent while a node is crashed
-	boots   uint64                  // varies each node's timeout randomness across restarts
+	resizeMu sync.Mutex // serializes Resize, which releases mu while it waits
+	mu       sync.Mutex
+	members  map[raft.NodeID]*member // absent while a node is crashed
+	boots    uint64                  // varies each node's timeout randomness across restarts
+	founders []raft.NodeID           // the original members; later servers join with no Peers
+	nextID   raft.NodeID             // IDs are never reused: a wiped server must not vote twice in a term
 }
 
 type member struct {
@@ -53,25 +58,114 @@ func NewLab(size int, dir string) (*Lab, error) {
 	return l, nil
 }
 
-// Resize replaces the cluster with a fresh one of n nodes.
-// ponytail: Raft here has static membership, so scaling wipes all state and
-// re-elects; live add/remove needs joint-consensus or single-server changes in internal/raft.
+// Resize grows or shrinks the running cluster to n voters with a live
+// membership change (joint consensus), keeping data and leadership. New
+// servers get fresh, never-reused IDs; the highest IDs are removed first.
+// It waits for the change to commit and fails if the cluster cannot manage
+// that in time (no leader, no quorum). A failed grow leaves its new servers
+// running and listed.
 func (l *Lab) Resize(n int) error {
 	if n < 1 || n > MaxNodes {
 		return fmt.Errorf("cluster size must be 1..%d", MaxNodes)
 	}
+	l.resizeMu.Lock()
+	defer l.resizeMu.Unlock()
+	l.mu.Lock()
+	if len(l.ids) == 0 {
+		defer l.mu.Unlock()
+		return l.bootstrap(n)
+	}
+	cur := slices.Clone(l.ids)
+	target := slices.Clone(cur)
+	for len(target) < n {
+		id := l.nextID
+		l.nextID++
+		l.ids = append(l.ids, id)
+		target = append(target, id)
+		if err := l.start(id); err != nil {
+			l.mu.Unlock()
+			return err
+		}
+	}
+	l.mu.Unlock()
+	if n < len(cur) {
+		target = target[:n]
+	}
+	if slices.Equal(cur, target) {
+		return nil
+	}
+	if err := l.changeMembership(target); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	old := l.ids
-	for _, id := range old {
+	for _, id := range cur[min(n, len(cur)):] {
 		_ = l.crash(id)
 		_ = os.RemoveAll(filepath.Join(l.dir, fmt.Sprint(id)))
 	}
+	l.ids = target
+	return nil
+}
+
+// changeMembership asks the leader to move to target and waits until that
+// configuration is committed on a member.
+func (l *Lab) changeMembership(target []raft.NodeID) error {
+	var err error
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		if lead := l.leaderNode(); lead != nil {
+			if _, err = lead.ChangeMembership(target); err == nil {
+				break
+			}
+		} else {
+			err = errors.New("no leader")
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("cluster cannot change membership right now: %w", err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+		if l.settled(target) {
+			return nil
+		}
+	}
+	return errors.New("membership change did not commit (is a majority up and connected?)")
+}
+
+func (l *Lab) leaderNode() *raft.Node {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var best *raft.Node
+	var term uint64
+	for _, m := range l.members {
+		if s := m.node.Status(); s.Role == raft.Leader && s.Term >= term {
+			best, term = m.node, s.Term
+		}
+	}
+	return best
+}
+
+// settled reports whether some live member of target has committed exactly target.
+func (l *Lab) settled(target []raft.NodeID) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, id := range target {
+		if m := l.members[id]; m != nil {
+			s := m.node.Status()
+			if !s.Config.Joint() && slices.Equal(s.Config.Voters, target) && s.ConfigIndex <= s.CommitIndex {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// bootstrap boots a brand-new cluster of n founding members.
+func (l *Lab) bootstrap(n int) error {
 	l.net.Heal()
-	l.ids = nil
 	for i := 1; i <= n; i++ {
 		l.ids = append(l.ids, raft.NodeID(i))
 	}
+	l.founders, l.nextID = slices.Clone(l.ids), raft.NodeID(n+1)
 	for _, id := range l.ids {
 		if err := l.start(id); err != nil {
 			for _, x := range l.ids {
@@ -104,7 +198,7 @@ func (l *Lab) start(id raft.NodeID) error {
 	l.boots++
 	store := kv.New()
 	node, err := raft.New(raft.Config{
-		ID: id, Peers: l.ids, Initial: initial, Storage: wal, Machine: store,
+		ID: id, Peers: l.peersFor(id), Initial: initial, Storage: wal, Machine: store,
 		Clock: clock.System{}, Transport: l.net, SnapshotThreshold: 40, PreVote: true, CheckQuorum: true,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -122,6 +216,13 @@ func (l *Lab) start(id raft.NodeID) error {
 	l.members[id] = &member{node, store, wal, api}
 	l.net.Register(id, node.Handle)
 	node.Start()
+	return nil
+}
+
+func (l *Lab) peersFor(id raft.NodeID) []raft.NodeID {
+	if slices.Contains(l.founders, id) {
+		return l.founders
+	}
 	return nil
 }
 
