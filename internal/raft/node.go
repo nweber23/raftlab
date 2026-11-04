@@ -37,6 +37,10 @@ type Config struct {
 	// heard from a leader refuse to vote (thesis §6.2, §4.2.3).
 	CheckQuorum bool
 
+	// MaxInflight bounds, in batches of 64 entries, how far the leader runs
+	// ahead of a follower's acknowledgements. 1 is stop-and-wait; 0 means 8.
+	MaxInflight int
+
 	// SnapshotChunkSize is the most snapshot bytes sent in one InstallSnapshot
 	// message; 0 means 64 KiB.
 	SnapshotChunkSize int
@@ -84,6 +88,14 @@ type Node struct {
 	ackSeq     map[NodeID]uint64 // highest round each peer has echoed
 	reads      []*readReq        // ReadIndex requests waiting for confirmation or apply
 	snapOff    map[NodeID]uint64 // next snapshot byte to send each peer; reset when we compact
+
+	// Per-peer replication mode. A peer is probed (one message at a time,
+	// nextIndex only moves on acknowledgement) until it first accepts an
+	// AppendEntries; after that nextIndex runs ahead optimistically, bounded
+	// by MaxInflight, and a stall rewinds it. See sendAppend.
+	replicating map[NodeID]bool
+	stall       map[NodeID]int    // heartbeat ticks without progress while entries are outstanding
+	stallMatch  map[NodeID]uint64 // matchIndex when the stall count started
 
 	// Timers are replaced, never Reset, and each carries a generation: a
 	// real clock can run a callback that fired just before it was stopped,
@@ -301,6 +313,7 @@ func (n *Node) onHeartbeatTimer(gen uint64) {
 	if n.stopped || n.role != Leader || gen != n.heartbeatGen {
 		return
 	}
+	n.checkStalled()
 	n.broadcastHeartbeat()
 }
 
@@ -365,6 +378,7 @@ func (n *Node) becomeLeader() {
 	n.matchIndex = map[NodeID]uint64{}
 	n.ackSeq = map[NodeID]uint64{}
 	n.snapOff = map[NodeID]uint64{}
+	n.replicating, n.stall, n.stallMatch = map[NodeID]bool{}, map[NodeID]int{}, map[NodeID]uint64{}
 	n.syncProgress()
 	n.appendLocal(nil)
 	n.broadcastHeartbeat()
@@ -389,32 +403,63 @@ func (n *Node) Propose(command []byte) (index, term uint64, ok bool) {
 		return 0, 0, false
 	}
 	index = n.appendLocal(command)
-	n.broadcastHeartbeat()
+	n.replicate()
 	return index, n.currentTerm, true
 }
 
 const maxBatch = 64 // entries per AppendEntries
 
-// broadcastHeartbeat replicates to every peer (an empty AppendEntries when
-// the peer is caught up) and re-arms the heartbeat timer.
+// stallTicks is how many heartbeat intervals a follower may leave pipelined
+// entries unacknowledged before the leader assumes they were lost and resends.
+const stallTicks = 2
+
+// broadcastHeartbeat gives every peer a message now (entries if it can take
+// them, else an empty keepalive) and re-arms the heartbeat timer.
 func (n *Node) broadcastHeartbeat() {
 	for _, p := range n.peers() {
-		n.sendAppend(p)
+		if !n.sendAppend(p) {
+			n.sendKeepalive(p)
+		}
 	}
 	n.resetHeartbeatTimer()
 }
 
-// sendAppend sends peer p the entries from nextIndex[p] on.
-// ponytail: nothing tracks what is already in flight, so a burst of proposals
-// resends overlapping batches; harmless because followers skip entries they
-// already hold. Add pipelining state if bandwidth matters.
-func (n *Node) sendAppend(p NodeID) {
+// replicate ships new entries to every peer that has room; it sends nothing
+// to a peer whose window is full or that is already caught up.
+func (n *Node) replicate() {
+	for _, p := range n.peers() {
+		n.sendAppend(p)
+	}
+}
+
+func (n *Node) window() uint64 {
+	w := n.cfg.MaxInflight
+	if w <= 0 {
+		w = 8
+	}
+	return uint64(w) * maxBatch
+}
+
+// sendAppend sends peer p the entries after nextIndex[p] and reports whether it
+// sent anything.
+//
+// A probed peer gets one message per call, empty if need be, and nextIndex does
+// not move until it answers: the reply tells us where its log really is. A
+// replicating peer gets entries as long as fewer than MaxInflight batches are
+// unacknowledged, and nextIndex advances at once, so a burst of proposals
+// streams out instead of being resent from the same point on every reply.
+func (n *Node) sendAppend(p NodeID) bool {
 	next := n.nextIndex[p]
 	if next <= n.snapIndex { // the entries it needs are compacted away
+		n.replicating[p] = false
 		n.sendSnapshotChunk(p)
-		return
+		return true
 	}
 	prev := next - 1
+	repl := n.replicating[p]
+	if repl && (next > n.lastIndex() || prev-n.matchIndex[p] >= n.window()) {
+		return false // nothing new, or the window is full
+	}
 	hi := min(n.lastIndex(), prev+maxBatch)
 	n.send(p, AppendEntriesArgs{
 		Term: n.currentTerm, LeaderID: n.cfg.ID,
@@ -422,6 +467,40 @@ func (n *Node) sendAppend(p NodeID) {
 		Entries:      append([]Entry(nil), n.entries(prev, hi)...),
 		LeaderCommit: n.commitIndex, ReadSeq: n.hbSeq,
 	})
+	if repl {
+		n.nextIndex[p] = hi + 1
+	}
+	return true
+}
+
+// sendKeepalive tells a replicating peer we still lead without naming entries
+// it may not have yet: it anchors at the last index known to match, so it can
+// never fail the consistency check and trigger a pointless rewind.
+func (n *Node) sendKeepalive(p NodeID) {
+	prev := max(n.matchIndex[p], n.snapIndex)
+	n.send(p, AppendEntriesArgs{
+		Term: n.currentTerm, LeaderID: n.cfg.ID,
+		PrevLogIndex: prev, PrevLogTerm: n.termAt(prev),
+		LeaderCommit: n.commitIndex, ReadSeq: n.hbSeq,
+	})
+}
+
+// checkStalled rewinds peers whose pipelined entries have gone unacknowledged
+// for stallTicks heartbeats: the messages (or their replies) were presumably
+// lost, and the peer is probed again from its last known match.
+func (n *Node) checkStalled() {
+	for _, p := range n.peers() {
+		out := n.replicating[p] && n.nextIndex[p]-1 > n.matchIndex[p]
+		switch {
+		case !out || n.matchIndex[p] != n.stallMatch[p]:
+			n.stall[p], n.stallMatch[p] = 0, n.matchIndex[p]
+		default:
+			if n.stall[p]++; n.stall[p] >= stallTicks {
+				n.stall[p] = 0
+				n.nextIndex[p], n.replicating[p] = n.matchIndex[p]+1, false
+			}
+		}
+	}
 }
 
 func (n *Node) markActive(p NodeID) {
@@ -668,6 +747,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	if r.Success {
 		n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 		n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
+		n.replicating[from] = true
 		n.advanceCommit()
 		if n.nextIndex[from] <= n.lastIndex() {
 			n.sendAppend(from) // more to ship
@@ -691,7 +771,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	}
 	next = max(next, n.matchIndex[from]+1, 1)
 	if next < n.nextIndex[from] { // otherwise a stale reply: ignore, no resend
-		n.nextIndex[from] = next
+		n.nextIndex[from], n.replicating[from] = next, false
 		n.sendAppend(from)
 	}
 }

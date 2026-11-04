@@ -92,7 +92,7 @@ func (n *Node) ChangeMembership(voters []NodeID) (uint64, error) {
 		return 0, ErrNotReady
 	}
 	idx := n.appendConfig(Membership{Voters: voters, Old: n.conf.Voters})
-	n.broadcastHeartbeat()
+	n.replicate()
 	return idx, nil
 }
 
@@ -163,7 +163,7 @@ func (n *Node) afterCommit() {
 	switch {
 	case n.conf.Joint():
 		n.appendConfig(Membership{Voters: n.conf.Voters})
-		n.broadcastHeartbeat()
+		n.replicate()
 	case !n.conf.Has(n.cfg.ID):
 		n.becomeFollower(n.currentTerm)
 	}
