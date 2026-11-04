@@ -130,3 +130,65 @@ func TestSnapshotsUnderChurn(t *testing.T) {
 		c.Fatalf("no convergence")
 	}
 }
+
+// With a tiny chunk size a snapshot needs many messages; none may exceed the
+// chunk, together they must reproduce the image, and the laggard must catch up.
+func TestSnapshotIsStreamedInChunks(t *testing.T) {
+	const chunk = 64
+	c := raftest.NewCluster(t, raftest.Options{Size: 3, Seed: 81, SnapshotThreshold: 10, SnapshotChunk: chunk})
+	l := c.WaitLeader()
+	laggard := c.IDs[0]
+	if laggard == l {
+		laggard = c.IDs[1]
+	}
+	c.Net.Isolate(laggard)
+	want := cmds("chunky", 60)
+	for _, w := range want {
+		c.Propose(w)
+		c.Run(20 * time.Millisecond)
+	}
+	var sent, biggest int
+	var done int
+	c.Net.Observe(func(e transport.Event) {
+		if a, ok := e.Msg.Body.(raft.InstallSnapshotArgs); ok && !e.Dropped {
+			sent++
+			biggest = max(biggest, len(a.Data))
+			if a.Done {
+				done++
+			}
+		}
+	})
+	c.Net.Heal()
+	if !c.RunUntil(10*time.Second, func() bool { return converged(c, c.IDs, want) }) {
+		c.Fatalf("laggard applied %d of %d", len(c.Applied(laggard)), len(want))
+	}
+	if biggest > chunk || sent < 3 || done == 0 {
+		c.Fatalf("expected a multi-chunk transfer: %d messages, largest chunk %d bytes, %d final chunks", sent, biggest, done)
+	}
+}
+
+// Chunks get lost, duplicated and reordered; the follower must still end up
+// with exactly the leader's image (a wrongly stitched snapshot fails the
+// state comparison or panics in Restore).
+func TestChunkedSnapshotSurvivesBadNetwork(t *testing.T) {
+	for seed := uint64(1); seed <= 8; seed++ {
+		c := raftest.NewCluster(t, raftest.Options{Size: 3, Seed: 90 + seed, SnapshotThreshold: 8, SnapshotChunk: 40})
+		l := c.WaitLeader()
+		laggard := c.IDs[0]
+		if laggard == l {
+			laggard = c.IDs[1]
+		}
+		c.Net.Isolate(laggard)
+		want := cmds("lossy", 50)
+		for _, w := range want {
+			c.Propose(w)
+			c.Run(20 * time.Millisecond)
+		}
+		c.Net.Heal()
+		c.Net.SetLoss(0.25, 0.3)
+		c.Net.SetDelay(0, 60*time.Millisecond)
+		if !c.RunUntil(60*time.Second, func() bool { return converged(c, c.IDs, want) }) {
+			c.Fatalf("laggard applied %d of %d", len(c.Applied(laggard)), len(want))
+		}
+	}
+}

@@ -72,6 +72,8 @@ type Options struct {
 	Classic bool
 	// SnapshotThreshold is passed to every node (0 disables compaction).
 	SnapshotThreshold int
+	// SnapshotChunk is passed to every node as SnapshotChunkSize (0 = default).
+	SnapshotChunk int
 	// Machine builds the state machine for a node; nil gives each node a Recorder.
 	Machine func(id raft.NodeID) raft.StateMachine
 	// OnBoot, if set, runs for every node (including restarts) just before it starts.
@@ -148,7 +150,7 @@ func (c *Cluster) boot(id raft.NodeID) {
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
 		PreVote:           !c.Opts.Classic, CheckQuorum: !c.Opts.Classic,
-		Clock: c.Clock, Transport: c.Net, Machine: sm, SnapshotThreshold: c.Opts.SnapshotThreshold,
+		Clock: c.Clock, Transport: c.Net, Machine: sm, SnapshotThreshold: c.Opts.SnapshotThreshold, SnapshotChunkSize: c.Opts.SnapshotChunk,
 		Rand: rand.New(rand.NewPCG(c.Opts.Seed+c.restarts[id], uint64(id))),
 	})
 	if err != nil {

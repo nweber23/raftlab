@@ -13,7 +13,7 @@ import (
 func newKVCluster(t testing.TB, size int, seed uint64) (*raftest.Cluster, map[raft.NodeID]*kv.Store) {
 	stores := map[raft.NodeID]*kv.Store{}
 	c := raftest.NewCluster(t, raftest.Options{
-		Size: size, Seed: seed, SnapshotThreshold: 20,
+		Size: size, Seed: seed, SnapshotThreshold: 20, SnapshotChunk: 200, // small, so snapshots are streamed
 		Machine: func(raft.NodeID) raft.StateMachine { return kv.New() },
 		OnBoot: func(id raft.NodeID, n *raft.Node, sm raft.StateMachine) {
 			s := sm.(*kv.Store)

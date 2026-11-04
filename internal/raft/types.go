@@ -107,20 +107,28 @@ func (s Status) FirstIndex() uint64 { return s.LastIndex - uint64(len(s.Log)) + 
 func (s Status) EntryAt(i uint64) Entry { return s.Log[i-s.FirstIndex()] }
 
 // InstallSnapshotArgs is the InstallSnapshot RPC request (Figure 13). The
-// whole snapshot travels in one message; there is no chunking.
+// image travels in chunks: Data is the slice starting at byte Offset, and Done
+// marks the last one.
 type InstallSnapshotArgs struct {
 	Term              uint64
 	LeaderID          NodeID
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
 	Config            Membership // membership as of LastIncludedIndex
+	Offset            uint64
 	Data              []byte
+	Done              bool
 }
 
-// InstallSnapshotReply is the InstallSnapshot RPC response.
+// InstallSnapshotReply is the InstallSnapshot RPC response. While a transfer
+// is in progress MatchIndex is 0 and NextOffset says which byte the follower
+// wants next (so a lost, duplicated or out-of-order chunk just moves the
+// leader's cursor). When the snapshot is installed, MatchIndex is set.
 type InstallSnapshotReply struct {
-	Term       uint64
-	MatchIndex uint64 // the follower's log now matches the leader's up to here
+	Term              uint64
+	LastIncludedIndex uint64 // which snapshot this answers
+	NextOffset        uint64
+	MatchIndex        uint64 // the follower's log now matches the leader's up to here
 }
 
 // Message is one datagram between two nodes. Body is one of the Args/Reply

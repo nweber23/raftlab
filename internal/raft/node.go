@@ -37,6 +37,10 @@ type Config struct {
 	// heard from a leader refuse to vote (thesis §6.2, §4.2.3).
 	CheckQuorum bool
 
+	// SnapshotChunkSize is the most snapshot bytes sent in one InstallSnapshot
+	// message; 0 means 64 KiB.
+	SnapshotChunkSize int
+
 	// SnapshotThreshold compacts the log once this many applied entries sit
 	// after the last snapshot. 0 disables compaction.
 	SnapshotThreshold int
@@ -56,7 +60,8 @@ type Node struct {
 	snapIndex   uint64  // last index covered by the snapshot
 	snapTerm    uint64
 	snapData    []byte
-	snapConf    Membership // membership as of snapIndex
+	snapConf    Membership    // membership as of snapIndex
+	snapIn      *snapAssembly // follower: snapshot being received
 
 	// Active membership: the newest config entry in the log (or snapConf).
 	conf      Membership
@@ -78,6 +83,7 @@ type Node struct {
 	hbSeq      uint64            // ReadIndex round counter, stamped on outgoing AppendEntries
 	ackSeq     map[NodeID]uint64 // highest round each peer has echoed
 	reads      []*readReq        // ReadIndex requests waiting for confirmation or apply
+	snapOff    map[NodeID]uint64 // next snapshot byte to send each peer; reset when we compact
 
 	// Timers are replaced, never Reset, and each carries a generation: a
 	// real clock can run a callback that fired just before it was stopped,
@@ -358,6 +364,7 @@ func (n *Node) becomeLeader() {
 	n.nextIndex = map[NodeID]uint64{}
 	n.matchIndex = map[NodeID]uint64{}
 	n.ackSeq = map[NodeID]uint64{}
+	n.snapOff = map[NodeID]uint64{}
 	n.syncProgress()
 	n.appendLocal(nil)
 	n.broadcastHeartbeat()
@@ -404,10 +411,7 @@ func (n *Node) broadcastHeartbeat() {
 func (n *Node) sendAppend(p NodeID) {
 	next := n.nextIndex[p]
 	if next <= n.snapIndex { // the entries it needs are compacted away
-		n.send(p, InstallSnapshotArgs{
-			Term: n.currentTerm, LeaderID: n.cfg.ID,
-			LastIncludedIndex: n.snapIndex, LastIncludedTerm: n.snapTerm, Config: n.snapConf, Data: n.snapData,
-		})
+		n.sendSnapshotChunk(p)
 		return
 	}
 	prev := next - 1
@@ -424,6 +428,27 @@ func (n *Node) markActive(p NodeID) {
 	if n.active != nil {
 		n.active[p] = true
 	}
+}
+
+const defaultSnapshotChunk = 64 << 10
+
+// sendSnapshotChunk sends peer p the next chunk of our snapshot. Replies move
+// the cursor, and heartbeats resend the current chunk, so loss costs one tick.
+func (n *Node) sendSnapshotChunk(p NodeID) {
+	size := uint64(n.cfg.SnapshotChunkSize)
+	if size == 0 {
+		size = defaultSnapshotChunk
+	}
+	off := n.snapOff[p]
+	if off > uint64(len(n.snapData)) {
+		off = 0
+	}
+	end := min(off+size, uint64(len(n.snapData)))
+	n.send(p, InstallSnapshotArgs{
+		Term: n.currentTerm, LeaderID: n.cfg.ID,
+		LastIncludedIndex: n.snapIndex, LastIncludedTerm: n.snapTerm, Config: n.snapConf,
+		Offset: off, Data: n.snapData[off:end], Done: end == uint64(len(n.snapData)),
+	})
 }
 
 // advanceCommit moves commitIndex to the highest index stored on a majority
@@ -468,6 +493,7 @@ func (n *Node) compact() {
 		must(n.cfg.Storage.SaveSnapshot(snap, tail))
 	}
 	n.snapIndex, n.snapTerm, n.snapData, n.snapConf, n.log = snap.Index, snap.Term, snap.Data, snap.Config, tail
+	clear(n.snapOff) // cursors pointed into the old image
 }
 
 // persistAppend makes "log truncated to after, then entries appended" durable.
@@ -670,19 +696,59 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	}
 }
 
+// snapAssembly collects the chunks of one incoming snapshot. It is keyed by
+// the sending leader's term as well as the snapshot's identity: two leaders may
+// serialize the same state differently, so their chunks must never be mixed.
+type snapAssembly struct {
+	leaderTerm, index, term uint64
+	buf                     []byte
+}
+
 func (n *Node) handleInstallSnapshot(from NodeID, a InstallSnapshotArgs) {
 	if a.Term < n.currentTerm {
-		n.send(from, InstallSnapshotReply{Term: n.currentTerm})
+		n.send(from, InstallSnapshotReply{Term: n.currentTerm, LastIncludedIndex: a.LastIncludedIndex})
 		return
 	}
 	n.becomeFollower(a.Term)
 	n.leader, n.leaderLive = a.LeaderID, true
 	n.resetElectionTimer()
 
+	reply := InstallSnapshotReply{Term: n.currentTerm, LastIncludedIndex: a.LastIncludedIndex}
 	if a.LastIncludedIndex <= n.commitIndex { // we already have all of it
-		n.send(from, InstallSnapshotReply{Term: n.currentTerm, MatchIndex: a.LastIncludedIndex})
+		n.snapIn = nil
+		reply.MatchIndex = a.LastIncludedIndex
+		n.send(from, reply)
 		return
 	}
+	asm := n.snapIn
+	switch {
+	case a.Offset == 0: // (re)start; a duplicate of chunk 0 just costs a restart
+		asm = &snapAssembly{leaderTerm: a.Term, index: a.LastIncludedIndex, term: a.LastIncludedTerm}
+		n.snapIn = asm
+	case asm == nil || asm.leaderTerm != a.Term || asm.index != a.LastIncludedIndex || asm.term != a.LastIncludedTerm:
+		n.send(from, reply) // nothing to continue: ask for the start
+		return
+	}
+	if a.Offset != uint64(len(asm.buf)) { // duplicate or gap: say where we are
+		reply.NextOffset = uint64(len(asm.buf))
+		n.send(from, reply)
+		return
+	}
+	asm.buf = append(asm.buf, a.Data...)
+	reply.NextOffset = uint64(len(asm.buf))
+	if !a.Done {
+		n.send(from, reply)
+		return
+	}
+	n.snapIn = nil
+	a.Data = asm.buf
+	n.installSnapshot(a)
+	reply.MatchIndex = a.LastIncludedIndex
+	n.send(from, reply)
+}
+
+// installSnapshot adopts a fully received snapshot.
+func (n *Node) installSnapshot(a InstallSnapshotArgs) {
 	// If our log holds the snapshot's last entry, keep what follows it;
 	// otherwise the whole log is superseded (Figure 13, steps 6-7).
 	var tail []Entry
@@ -697,7 +763,6 @@ func (n *Node) handleInstallSnapshot(from NodeID, a InstallSnapshotArgs) {
 	n.refreshConfig()
 	n.commitIndex, n.lastApplied = snap.Index, snap.Index
 	n.cfg.Machine.Restore(snap.Data)
-	n.send(from, InstallSnapshotReply{Term: n.currentTerm, MatchIndex: snap.Index})
 }
 
 func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
@@ -709,6 +774,16 @@ func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
 		return
 	}
 	n.markActive(from)
+	if r.MatchIndex == 0 { // chunk accepted, or the follower wants another position
+		if r.LastIncludedIndex == n.snapIndex && r.NextOffset != n.snapOff[from] { // else: about a replaced snapshot
+			n.snapOff[from] = r.NextOffset
+			n.sendAppend(from)
+		}
+		return
+	}
+	if r.LastIncludedIndex == n.snapIndex {
+		delete(n.snapOff, from)
+	}
 	n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 	n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
 	n.advanceCommit()

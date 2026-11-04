@@ -393,7 +393,7 @@ func describe(e transport.Event) MsgEvent {
 	case raft.AppendEntriesReply:
 		ev.Detail = fmt.Sprintf("success=%v match=%d", b.Success, b.MatchIndex)
 	case raft.InstallSnapshotArgs:
-		ev.Detail = fmt.Sprintf("through index %d", b.LastIncludedIndex)
+		ev.Detail = fmt.Sprintf("through index %d, bytes %d+%d", b.LastIncludedIndex, b.Offset, len(b.Data))
 	case raft.InstallSnapshotReply:
 		ev.Detail = fmt.Sprintf("match=%d", b.MatchIndex)
 	}
