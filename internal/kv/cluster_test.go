@@ -11,9 +11,16 @@ import (
 )
 
 func newKVCluster(t testing.TB, size int, seed uint64) (*raftest.Cluster, map[raft.NodeID]*kv.Store) {
+	return newKVClusterOpts(t, size, seed, false)
+}
+
+// newKVClusterOpts can run the classic protocol (no PreVote/CheckQuorum), where
+// a partitioned leader keeps believing it leads: the hardest case for reads.
+func newKVClusterOpts(t testing.TB, size int, seed uint64, classic bool) (*raftest.Cluster, map[raft.NodeID]*kv.Store) {
 	stores := map[raft.NodeID]*kv.Store{}
 	c := raftest.NewCluster(t, raftest.Options{
-		Size: size, Seed: seed, SnapshotThreshold: 20, SnapshotChunk: 200, // small, so snapshots are streamed
+		Classic: classic,
+		Size:    size, Seed: seed, SnapshotThreshold: 20, SnapshotChunk: 200, // small, so snapshots are streamed
 		Machine: func(raft.NodeID) raft.StateMachine { return kv.New() },
 		OnBoot: func(id raft.NodeID, n *raft.Node, sm raft.StateMachine) {
 			s := sm.(*kv.Store)

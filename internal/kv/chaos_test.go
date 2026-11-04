@@ -9,13 +9,15 @@ import (
 	"time"
 
 	"github.com/nweber23/raftlab/internal/kv"
+	"github.com/nweber23/raftlab/internal/linz"
 	"github.com/nweber23/raftlab/internal/raft"
 	"github.com/nweber23/raftlab/internal/raft/raftest"
 )
 
 // The chaos test crashes nodes, partitions the network and perturbs delivery
-// while clients write, then heals everything and checks that the replicas
-// converge and no acknowledged write was lost. The cluster runs on a fake
+// while clients read and write shared keys, then heals everything, checks that
+// the replicas converge, and checks the complete recorded history for
+// linearizability. The cluster runs on a fake
 // clock, so a seed reproduces a run exactly:
 //
 //	CHAOS_SEED=17 go test -race -run Chaos -v ./internal/kv
@@ -39,20 +41,24 @@ func TestChaos(t *testing.T) {
 	}
 }
 
-// chaosClient is a sequential client with a private key it only ever
-// increments, so every read has exactly one correct answer.
+// chaosClient is a sequential client. Clients share a few keys, so reads can
+// observe anyone's writes; whether the result is plausible is decided by the
+// linearizability checker, not by the client.
 type chaosClient struct {
-	id        string
-	key       string
-	seq       uint64
-	written   int // value of the newest Set it has started
-	acked     int // value of the newest Set that was acknowledged
-	op        *kv.Op
-	pending   *kv.Pending
-	sentAt    int
-	ackedSets int
-	stopNew   bool
+	n       int
+	id      string
+	seq     uint64
+	vals    int // values written so far, to keep every write unique
+	op      *kv.Op
+	viaRead bool // a get served by ReadIndex instead of the log
+	call    int  // step at which the current op was invoked
+	pending *kv.Pending
+	sentAt  int
+	done    int
+	stopNew bool
 }
+
+var chaosKeys = []string{"a", "b"}
 
 func runChaos(t *testing.T, seed uint64) {
 	const (
@@ -60,12 +66,15 @@ func runChaos(t *testing.T, seed uint64) {
 		chaosSteps = 4000 // 40s of virtual time
 		retryAfter = 100  // steps (1s) before a client re-sends
 	)
-	c, stores := newKVCluster(t, nodes, seed)
+	// Odd seeds run the classic protocol, where a deposed leader lingers and
+	// stale reads are a real possibility; even seeds run with leases.
+	c, stores := newKVClusterOpts(t, nodes, seed, seed%2 == 1)
 	rng := rand.New(rand.NewPCG(seed, 0xc4a05))
 	clients := make([]*chaosClient, 4)
 	for i := range clients {
-		clients[i] = &chaosClient{id: fmt.Sprint("client", i), key: fmt.Sprint("key", i)}
+		clients[i] = &chaosClient{n: i, id: fmt.Sprint("client", i)}
 	}
+	var history []linz.KVOp
 	down := func(id raft.NodeID) bool { return c.Net.Faults().DownNodes[id] }
 	pickUp := func() (raft.NodeID, bool) {
 		var up []raft.NodeID
@@ -78,6 +87,9 @@ func runChaos(t *testing.T, seed uint64) {
 			return 0, false
 		}
 		return up[rng.IntN(len(up))], true
+	}
+	act := func(cl *chaosClient) {
+		cl.act(c, stores, rng, pickUp, stepCounter, retryAfter, &history)
 	}
 
 	step := func(chaos bool) {
@@ -107,7 +119,7 @@ func runChaos(t *testing.T, seed uint64) {
 			}
 		}
 		for _, cl := range clients {
-			cl.act(c, stores, rng, pickUp, chaosStepNow(c), retryAfter)
+			act(cl)
 		}
 		c.Run(raftest.Step)
 	}
@@ -137,7 +149,7 @@ func runChaos(t *testing.T, seed uint64) {
 		for _, cl := range clients {
 			if cl.op != nil {
 				stepCounter++
-				cl.act(c, stores, rng, pickUp, chaosStepNow(c), retryAfter)
+				act(cl)
 				if cl.op != nil {
 					return false
 				}
@@ -153,19 +165,24 @@ func runChaos(t *testing.T, seed uint64) {
 		c.Fatalf("replicas did not converge: %v | %v | %v", stores[1].Data(), stores[2].Data(), stores[3].Data())
 	}
 
-	// Durability: every acknowledged write is still there (the client is
-	// sequential, so the value is the last ack or the one write in flight).
-	data := stores[c.IDs[0]].Data()
-	total := 0
-	for _, cl := range clients {
-		got, err := strconv.Atoi(data[cl.key])
-		if cl.acked > 0 && (err != nil || got < cl.acked || got > cl.written) {
-			c.Fatalf("%s: store has %q, acked %d, attempted %d: acknowledged write lost", cl.id, data[cl.key], cl.acked, cl.written)
-		}
-		total += cl.ackedSets
+	// Linearizability: whatever the crashes, partitions and retries did, the
+	// operations clients saw must be explainable by one total order that
+	// respects real time. This covers durability (an acknowledged write is
+	// never lost), freshness (no stale read, log or ReadIndex) and
+	// exactly-once execution of retried writes.
+	if len(history) == 0 {
+		c.Fatalf("no operation ever completed; the test proved nothing")
 	}
-	if total == 0 {
-		c.Fatalf("no write was ever acknowledged; the test proved nothing")
+	var writes, reads int
+	for _, o := range history {
+		if o.Kind == linz.KVGet {
+			reads++
+		} else {
+			writes++
+		}
+	}
+	if err := linz.CheckKV(history); err != nil {
+		c.Fatalf("history of %d operations is not linearizable: %v", len(history), err)
 	}
 
 	// And the cluster is alive.
@@ -173,7 +190,7 @@ func runChaos(t *testing.T, seed uint64) {
 	if _, err := do(c, stores, l, kv.Op{Kind: kv.OpSet, Key: "final", Value: "ok", Client: "final", Seq: 1}); err != nil {
 		c.Fatalf("cluster unavailable after healing: %v", err)
 	}
-	t.Logf("seed %d: %d acknowledged writes", seed, total)
+	t.Logf("seed %d: %d linearizable operations (%d writes, %d reads)", seed, len(history), writes, reads)
 }
 
 // stepCounter is the virtual time in steps; chaos runs are single-goroutine
@@ -181,57 +198,67 @@ func runChaos(t *testing.T, seed uint64) {
 // ponytail: global, so chaos subtests must not use t.Parallel.
 var stepCounter int
 
-func chaosStepNow(*raftest.Cluster) int { return stepCounter }
-
 func (cl *chaosClient) act(c *raftest.Cluster, stores map[raft.NodeID]*kv.Store, rng *rand.Rand,
-	pickUp func() (raft.NodeID, bool), now, retryAfter int) {
+	pickUp func() (raft.NodeID, bool), now, retryAfter int, history *[]linz.KVOp) {
 	if cl.op == nil {
 		if cl.stopNew {
 			return
 		}
 		cl.seq++
-		if cl.written > 0 && rng.IntN(3) == 0 {
-			cl.op = &kv.Op{Kind: kv.OpGet, Key: cl.key, Client: cl.id, Seq: cl.seq}
-		} else {
-			cl.written++
-			cl.op = &kv.Op{Kind: kv.OpSet, Key: cl.key, Value: strconv.Itoa(cl.written), Client: cl.id, Seq: cl.seq}
+		cl.call, cl.viaRead = now, false
+		key := chaosKeys[rng.IntN(len(chaosKeys))]
+		switch r := rng.IntN(10); {
+		case r < 5:
+			cl.vals++
+			cl.op = &kv.Op{Kind: kv.OpSet, Key: key, Value: fmt.Sprintf("%s#%d", cl.id, cl.vals), Client: cl.id, Seq: cl.seq}
+		case r < 8:
+			cl.op = &kv.Op{Kind: kv.OpGet, Key: key, Client: cl.id, Seq: cl.seq}
+			cl.viaRead = rng.IntN(2) == 0
+		default:
+			cl.op = &kv.Op{Kind: kv.OpDelete, Key: key, Client: cl.id, Seq: cl.seq}
 		}
 		cl.pending = nil
 	}
 	if cl.pending != nil {
 		select {
 		case <-cl.pending.Done():
-			cl.finish(c)
-			return
+			if cl.pending.Err() != nil { // the reading leader lost its seat: ask again
+				cl.pending = nil
+			} else {
+				cl.finish(c, now, history)
+				return
+			}
 		default:
-		}
-		if now-cl.sentAt < retryAfter {
-			return
+			if now-cl.sentAt < retryAfter {
+				return
+			}
 		}
 	}
 	// (Re)send to a random live node; followers just refuse.
 	if id, ok := pickUp(); ok {
-		if p, err := stores[id].Submit(*cl.op); err == nil {
+		var p *kv.Pending
+		var err error
+		if cl.viaRead {
+			p, err = stores[id].Read(cl.op.Key)
+		} else {
+			p, err = stores[id].Submit(*cl.op)
+		}
+		if err == nil {
 			cl.pending, cl.sentAt = p, now
 		}
 	}
 }
 
-func (cl *chaosClient) finish(c *raftest.Cluster) {
+func (cl *chaosClient) finish(c *raftest.Cluster, now int, history *[]linz.KVOp) {
 	res := cl.pending.Result()
 	if res.Err != "" {
 		c.Fatalf("%s: unexpected error %q for %+v", cl.id, res.Err, *cl.op)
 	}
-	switch cl.op.Kind {
-	case kv.OpSet:
-		cl.acked = cl.written
-		cl.ackedSets++
-	case kv.OpGet:
-		// Sequential client: the only possible answer is its last acked write.
-		if cl.acked > 0 && (!res.Found || res.Value != strconv.Itoa(cl.acked)) {
-			c.Fatalf("%s: read %q (found=%v), want %d: stale or lost write", cl.id, res.Value, res.Found, cl.acked)
-		}
-	}
+	*history = append(*history, linz.KVOp{
+		Client: cl.n, Call: int64(cl.call), Return: int64(now),
+		Kind: cl.op.Kind, Key: cl.op.Key, Value: cl.op.Value, Found: res.Found, Got: res.Value,
+	})
+	cl.done++
 	cl.op, cl.pending = nil, nil
 }
 
