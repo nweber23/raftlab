@@ -81,6 +81,9 @@ type AppendEntriesArgs struct {
 	PrevLogTerm  uint64
 	Entries      []Entry
 	LeaderCommit uint64
+	// ReadSeq numbers the leader's ReadIndex rounds; followers echo it, which
+	// proves the leader still led when it handled this message.
+	ReadSeq uint64
 }
 
 // AppendEntriesReply is the AppendEntries RPC response (Figure 2).
@@ -94,6 +97,7 @@ type AppendEntriesReply struct {
 	MatchIndex    uint64 // on success: last index known to match the leader
 	ConflictIndex uint64 // on failure: where the leader should retry from
 	ConflictTerm  uint64 // on failure: term of the conflicting entry, 0 if the log was too short
+	ReadSeq       uint64 // echo of AppendEntriesArgs.ReadSeq
 }
 
 // FirstIndex is the log index of Log[0] (SnapIndex+1).

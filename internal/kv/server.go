@@ -76,9 +76,20 @@ func (s *Server) serveKV(kind string) http.HandlerFunc {
 			return
 		}
 
-		p, err := s.Store.Submit(op)
-		if errors.Is(err, ErrNotLeader) {
+		var p *Pending
+		var err error
+		if kind == OpGet {
+			p, err = s.Store.Read(op.Key)
+		} else {
+			p, err = s.Store.Submit(op)
+		}
+		if errors.Is(err, ErrNotLeader) || errors.Is(err, raft.ErrNotLeader) {
 			s.redirect(w, r)
+			return
+		}
+		if errors.Is(err, raft.ErrNotReady) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		if err != nil {
@@ -97,6 +108,10 @@ func (s *Server) serveKV(kind string) http.HandlerFunc {
 			http.Error(w, "timed out waiting for commit; retry with the same request ID", http.StatusGatewayTimeout)
 			return
 		case <-r.Context().Done():
+			return
+		}
+		if p.Err() != nil { // the read's leader lost its lease; the client can retry
+			s.redirect(w, r)
 			return
 		}
 		res := p.Result()

@@ -1,6 +1,7 @@
-// Package kv is a linearizable key-value store replicated with Raft. Every
-// operation, reads included, goes through the log. Clients tag writes with a
-// (client, seq) pair so a retried request is applied at most once.
+// Package kv is a linearizable key-value store replicated with Raft. Writes go
+// through the log; clients tag them with a (client, seq) pair so a retried
+// request is applied at most once. Reads use Raft's ReadIndex and skip the log
+// (Submit with OpGet still works and is also linearizable).
 package kv
 
 import (
@@ -53,6 +54,7 @@ type waitKey struct {
 type Pending struct {
 	done chan struct{}
 	res  Result
+	err  error // set instead of res when leadership was lost before a read completed
 }
 
 // Done is closed once Result is valid.
@@ -60,6 +62,10 @@ func (p *Pending) Done() <-chan struct{} { return p.done }
 
 // Result returns the outcome; valid after Done is closed.
 func (p *Pending) Result() Result { return p.res }
+
+// Err is non-nil, once Done is closed, if a read lost its leader before it
+// could complete; the caller should retry elsewhere.
+func (p *Pending) Err() error { return p.err }
 
 // Store is the state machine plus the glue to submit operations to Raft.
 type Store struct {
@@ -119,6 +125,28 @@ func (s *Store) Submit(op Op) (*Pending, error) {
 		delete(s.waiters, k)
 		s.mu.Unlock()
 		return nil, ErrNotLeader
+	}
+	return p, nil
+}
+
+// Read looks key up without writing to the log, using Raft's ReadIndex: the
+// leader confirms it is still the leader, waits for its state machine to catch
+// up, then reads locally. It returns raft.ErrNotLeader on a follower and
+// raft.ErrNotReady for a brand-new leader; both are retryable.
+func (s *Store) Read(key string) (*Pending, error) {
+	p := &Pending{done: make(chan struct{})}
+	err := s.node.ReadIndex(func(err error) { // inside the node's lock, like Apply
+		if err != nil {
+			p.err = err
+		} else {
+			s.mu.Lock()
+			p.res.Value, p.res.Found = s.data[key]
+			s.mu.Unlock()
+		}
+		close(p.done)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return p, nil
 }

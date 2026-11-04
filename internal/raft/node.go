@@ -75,6 +75,9 @@ type Node struct {
 	// Leader only, reinitialized on election (Figure 2).
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
+	hbSeq      uint64            // ReadIndex round counter, stamped on outgoing AppendEntries
+	ackSeq     map[NodeID]uint64 // highest round each peer has echoed
+	reads      []*readReq        // ReadIndex requests waiting for confirmation or apply
 
 	// Timers are replaced, never Reset, and each carries a generation: a
 	// real clock can run a callback that fired just before it was stopped,
@@ -138,6 +141,7 @@ func (n *Node) Stop() {
 	n.stopped = true
 	n.stopElectionTimer()
 	n.stopHeartbeatTimer()
+	n.failReads()
 }
 
 // Status returns a snapshot of the node.
@@ -304,6 +308,7 @@ func (n *Node) becomeFollower(term uint64) {
 	n.role, n.votes, n.preVoting, n.active = Follower, nil, false, nil
 	if wasLeader {
 		n.leader = NoNode
+		n.failReads()
 	}
 	n.stopHeartbeatTimer()
 	if wasLeader {
@@ -352,6 +357,7 @@ func (n *Node) becomeLeader() {
 	}
 	n.nextIndex = map[NodeID]uint64{}
 	n.matchIndex = map[NodeID]uint64{}
+	n.ackSeq = map[NodeID]uint64{}
 	n.syncProgress()
 	n.appendLocal(nil)
 	n.broadcastHeartbeat()
@@ -410,7 +416,7 @@ func (n *Node) sendAppend(p NodeID) {
 		Term: n.currentTerm, LeaderID: n.cfg.ID,
 		PrevLogIndex: prev, PrevLogTerm: n.termAt(prev),
 		Entries:      append([]Entry(nil), n.entries(prev, hi)...),
-		LeaderCommit: n.commitIndex,
+		LeaderCommit: n.commitIndex, ReadSeq: n.hbSeq,
 	})
 }
 
@@ -448,6 +454,7 @@ func (n *Node) applyCommitted() {
 		n.compact()
 	}
 	n.afterCommit()
+	n.serviceReads()
 }
 
 // compact snapshots the state machine at lastApplied and drops the log prefix
@@ -565,6 +572,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 		return
 	}
 	// A current-term AppendEntries also demotes a candidate (§5.2).
+	seq := a.ReadSeq
 	n.becomeFollower(a.Term)
 	n.leader, n.leaderLive = a.LeaderID, true
 	n.resetElectionTimer()
@@ -576,7 +584,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 		a.Entries = a.Entries[skip:]
 		a.PrevLogIndex += skip
 		if a.PrevLogIndex < n.snapIndex { // all entries were older than the snapshot
-			n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: n.snapIndex})
+			n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: n.snapIndex, ReadSeq: seq})
 			return
 		}
 		a.PrevLogTerm = n.snapTerm
@@ -584,7 +592,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 
 	// Consistency check (Figure 2, step 2).
 	if a.PrevLogIndex > n.lastIndex() {
-		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: n.lastIndex() + 1})
+		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: n.lastIndex() + 1, ReadSeq: seq})
 		return
 	}
 	if t := n.termAt(a.PrevLogIndex); t != a.PrevLogTerm {
@@ -592,7 +600,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 		for first > n.snapIndex+1 && n.termAt(first-1) == t {
 			first--
 		}
-		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: first, ConflictTerm: t})
+		n.send(from, AppendEntriesReply{Term: n.currentTerm, ConflictIndex: first, ConflictTerm: t, ReadSeq: seq})
 		return
 	}
 
@@ -617,7 +625,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 		n.commitIndex = min(a.LeaderCommit, match)
 		n.applyCommitted()
 	}
-	n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: match})
+	n.send(from, AppendEntriesReply{Term: n.currentTerm, Success: true, MatchIndex: match, ReadSeq: seq})
 }
 
 func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
@@ -629,6 +637,8 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 		return
 	}
 	n.markActive(from)
+	n.ackSeq[from] = max(n.ackSeq[from], r.ReadSeq)
+	defer n.serviceReads() // every path below may change what has been applied
 	if r.Success {
 		n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 		n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
@@ -704,5 +714,69 @@ func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
 	n.advanceCommit()
 	if n.nextIndex[from] <= n.lastIndex() {
 		n.sendAppend(from)
+	}
+}
+
+// readReq is one ReadIndex request: it needs leadership confirmed by a quorum
+// echo of round seq, and the state machine caught up to idx.
+type readReq struct {
+	seq, idx  uint64
+	confirmed bool
+	fn        func(error)
+}
+
+// ReadIndex starts a linearizable read that does not touch the log (§8). The
+// leader records its commit index, confirms with a heartbeat round that it is
+// still the leader, waits until that index is applied, then calls fn(nil); the
+// state machine then reflects every write acknowledged before ReadIndex was
+// called. If leadership is lost first, fn gets ErrNotLeader.
+//
+// fn runs inside the node's critical section, possibly before ReadIndex
+// returns: it must be quick and must not call the Node. It may read the state
+// machine directly. A non-nil return means fn will never be called.
+func (n *Node) ReadIndex(fn func(error)) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped || n.role != Leader {
+		return ErrNotLeader
+	}
+	// A new leader does not know its commit index is current until it has
+	// committed something in its own term (its no-op).
+	if n.termAt(n.commitIndex) != n.currentTerm {
+		return ErrNotReady
+	}
+	n.hbSeq++
+	n.reads = append(n.reads, &readReq{seq: n.hbSeq, idx: n.commitIndex, fn: fn})
+	n.broadcastHeartbeat()
+	n.serviceReads() // a single-node cluster confirms itself
+	return nil
+}
+
+// serviceReads completes every read whose round is confirmed and applied.
+func (n *Node) serviceReads() {
+	if n.role != Leader {
+		n.failReads()
+		return
+	}
+	pending := n.reads[:0]
+	for _, r := range n.reads {
+		if !r.confirmed {
+			r.confirmed = n.hasQuorum(func(p NodeID) bool { return p == n.cfg.ID || n.ackSeq[p] >= r.seq })
+		}
+		if r.confirmed && n.lastApplied >= r.idx {
+			r.fn(nil)
+		} else {
+			pending = append(pending, r)
+		}
+	}
+	clear(n.reads[len(pending):]) // drop references held past the new length
+	n.reads = pending
+}
+
+func (n *Node) failReads() {
+	reads := n.reads
+	n.reads = nil
+	for _, r := range reads {
+		r.fn(ErrNotLeader)
 	}
 }
