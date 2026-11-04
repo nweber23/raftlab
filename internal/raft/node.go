@@ -24,6 +24,15 @@ type Config struct {
 
 	Initial PersistentState // zero value on first boot
 
+	// PreVote makes a timed-out follower ask whether it could win before it
+	// bumps its term, so a partitioned node cannot depose a healthy leader
+	// when it rejoins (thesis §9.6).
+	PreVote bool
+	// CheckQuorum makes a leader step down when it has not heard from a
+	// majority within an election timeout, and makes nodes that recently
+	// heard from a leader refuse to vote (thesis §6.2, §4.2.3).
+	CheckQuorum bool
+
 	// SnapshotThreshold compacts the log once this many applied entries sit
 	// after the last snapshot. 0 disables compaction.
 	SnapshotThreshold int
@@ -47,7 +56,10 @@ type Node struct {
 	// Volatile state.
 	role        Role
 	leader      NodeID
-	votes       map[NodeID]bool // candidate only: who granted us a vote this term
+	votes       map[NodeID]bool // candidate (or pre-candidate): who granted us a vote
+	preVoting   bool            // follower probing with PreVote, not yet a candidate
+	leaderLive  bool            // heard from a leader since our election timer last fired
+	active      map[NodeID]bool // leader only: peers that replied in this CheckQuorum window
 	commitIndex uint64
 	lastApplied uint64
 
@@ -194,6 +206,13 @@ func (n *Node) resetElectionTimer() {
 	n.electionTimer = n.cfg.Clock.AfterFunc(n.randomElectionTimeout(), func() { n.onElectionTimeout(gen) })
 }
 
+// armQuorumTimer re-arms the election timer as the leader's CheckQuorum window.
+func (n *Node) armQuorumTimer() {
+	n.stopElectionTimer()
+	gen := n.electionGen
+	n.electionTimer = n.cfg.Clock.AfterFunc(n.cfg.ElectionTimeoutMin, func() { n.onElectionTimeout(gen) })
+}
+
 func (n *Node) stopElectionTimer() {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
@@ -216,6 +235,17 @@ func (n *Node) stopHeartbeatTimer() {
 
 func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 
+// hasQuorum reports whether the nodes for which ok is true form a majority.
+func (n *Node) hasQuorum(ok func(NodeID) bool) bool {
+	c := 0
+	for _, p := range n.cfg.Peers {
+		if ok(p) {
+			c++
+		}
+	}
+	return c >= n.majority()
+}
+
 // --- election ---------------------------------------------------------------
 
 // onElectionTimeout is the election timer callback. It runs on the clock's
@@ -224,10 +254,30 @@ func (n *Node) majority() int { return len(n.cfg.Peers)/2 + 1 }
 func (n *Node) onElectionTimeout(gen uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role == Leader || gen != n.electionGen {
+	if n.stopped || gen != n.electionGen {
+		return
+	}
+	if n.role == Leader { // with CheckQuorum this timer is the leader's lease check
+		n.checkQuorum()
+		return
+	}
+	n.leaderLive = false
+	if n.cfg.PreVote && len(n.cfg.Peers) > 1 {
+		n.startPreVote()
 		return
 	}
 	n.startElection()
+}
+
+// checkQuorum steps the leader down unless a majority replied during the last
+// window, then opens a new one.
+func (n *Node) checkQuorum() {
+	if !n.hasQuorum(func(p NodeID) bool { return p == n.cfg.ID || n.active[p] }) {
+		n.becomeFollower(n.currentTerm) // also clears leader and re-arms a normal election timer
+		return
+	}
+	n.active = map[NodeID]bool{}
+	n.armQuorumTimer()
 }
 
 // onHeartbeatTimer is the heartbeat timer callback; it also takes mu itself.
@@ -244,25 +294,42 @@ func (n *Node) onHeartbeatTimer(gen uint64) {
 func (n *Node) becomeFollower(term uint64) {
 	wasLeader := n.role == Leader
 	if term > n.currentTerm {
-		n.currentTerm, n.votedFor, n.leader = term, NoNode, NoNode
+		n.currentTerm, n.votedFor, n.leader, n.leaderLive = term, NoNode, NoNode, false
 		n.persistState()
 	}
-	n.role, n.votes = Follower, nil
+	n.role, n.votes, n.preVoting, n.active = Follower, nil, false, nil
+	if wasLeader {
+		n.leader = NoNode
+	}
 	n.stopHeartbeatTimer()
 	if wasLeader {
 		n.resetElectionTimer() // becomeLeader stopped it
 	}
 }
 
+// startPreVote probes the cluster for the term this node would campaign in
+// without changing its own term or vote. A majority of grants starts the real
+// election; anything else leaves the cluster undisturbed.
+func (n *Node) startPreVote() {
+	n.preVoting, n.votes = true, map[NodeID]bool{n.cfg.ID: true}
+	n.resetElectionTimer() // if the probe fails, probe again later
+	li, lt := n.lastLog()
+	for _, p := range n.cfg.Peers {
+		if p != n.cfg.ID {
+			n.send(p, RequestVoteArgs{Term: n.currentTerm + 1, CandidateID: n.cfg.ID, LastLogIndex: li, LastLogTerm: lt, PreVote: true})
+		}
+	}
+}
+
 // startElection implements the Candidates rules of Figure 2.
 func (n *Node) startElection() {
 	n.currentTerm++
-	n.role, n.leader = Candidate, NoNode
+	n.role, n.leader, n.preVoting = Candidate, NoNode, false
 	n.votedFor = n.cfg.ID
 	n.persistState()
 	n.votes = map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer()
-	if len(n.votes) >= n.majority() { // single-node cluster
+	if n.hasQuorum(func(p NodeID) bool { return n.votes[p] }) { // single-node cluster
 		n.becomeLeader()
 		return
 	}
@@ -277,8 +344,12 @@ func (n *Node) startElection() {
 // becomeLeader switches to leader, appends a no-op so entries from earlier
 // terms can commit (§5.4.2, §8), and sends the first AppendEntries.
 func (n *Node) becomeLeader() {
-	n.role, n.leader, n.votes = Leader, n.cfg.ID, nil
+	n.role, n.leader, n.votes, n.preVoting = Leader, n.cfg.ID, nil, false
 	n.stopElectionTimer()
+	if n.cfg.CheckQuorum {
+		n.active = map[NodeID]bool{}
+		n.armQuorumTimer()
+	}
 	n.nextIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
 	n.matchIndex = make(map[NodeID]uint64, len(n.cfg.Peers))
 	for _, p := range n.cfg.Peers {
@@ -345,6 +416,12 @@ func (n *Node) sendAppend(p NodeID) {
 		Entries:      append([]Entry(nil), n.entries(prev, hi)...),
 		LeaderCommit: n.commitIndex,
 	})
+}
+
+func (n *Node) markActive(p NodeID) {
+	if n.active != nil {
+		n.active[p] = true
+	}
 }
 
 // advanceCommit moves commitIndex to the highest index stored on a majority
@@ -417,7 +494,34 @@ func must(err error) {
 	}
 }
 
+// leaseHeld reports whether this node has recently heard from a live leader
+// (or is one) and so must not help anyone replace it (thesis §4.2.3).
+func (n *Node) leaseHeld() bool {
+	return n.cfg.CheckQuorum && (n.role == Leader || n.leaderLive)
+}
+
+func (n *Node) upToDate(a RequestVoteArgs) bool {
+	li, lt := n.lastLog()
+	return a.LastLogTerm > lt || (a.LastLogTerm == lt && a.LastLogIndex >= li)
+}
+
+// handlePreVote answers a probe without touching term, vote or timers.
+func (n *Node) handlePreVote(from NodeID, a RequestVoteArgs) {
+	if a.Term > n.currentTerm && !n.leaseHeld() && n.upToDate(a) {
+		n.send(from, RequestVoteReply{Term: a.Term, VoteGranted: true, PreVote: true})
+		return
+	}
+	n.send(from, RequestVoteReply{Term: n.currentTerm, PreVote: true})
+}
+
 func (n *Node) handleRequestVote(from NodeID, a RequestVoteArgs) {
+	if a.PreVote {
+		n.handlePreVote(from, a)
+		return
+	}
+	if a.Term > n.currentTerm && n.leaseHeld() {
+		return // a healthy leader exists as far as we know; ignore the disruption
+	}
 	if a.Term > n.currentTerm {
 		n.becomeFollower(a.Term)
 	}
@@ -437,15 +541,28 @@ func (n *Node) handleRequestVote(from NodeID, a RequestVoteArgs) {
 }
 
 func (n *Node) handleRequestVoteReply(from NodeID, r RequestVoteReply) {
+	if r.PreVote {
+		// A grant carries the probed term (currentTerm+1) and must not be
+		// mistaken for a newer term; a refusal carries the voter's real term.
+		if r.VoteGranted {
+			if n.preVoting && r.Term == n.currentTerm+1 {
+				n.votes[from] = true
+				if n.hasQuorum(func(p NodeID) bool { return n.votes[p] }) {
+					n.startElection()
+				}
+			}
+			return
+		}
+	}
 	if r.Term > n.currentTerm {
 		n.becomeFollower(r.Term)
 		return
 	}
-	if n.role != Candidate || r.Term != n.currentTerm || !r.VoteGranted {
+	if r.PreVote || n.role != Candidate || r.Term != n.currentTerm || !r.VoteGranted {
 		return
 	}
 	n.votes[from] = true
-	if len(n.votes) >= n.majority() {
+	if n.hasQuorum(func(p NodeID) bool { return n.votes[p] }) {
 		n.becomeLeader()
 	}
 }
@@ -457,7 +574,7 @@ func (n *Node) handleAppendEntries(from NodeID, a AppendEntriesArgs) {
 	}
 	// A current-term AppendEntries also demotes a candidate (§5.2).
 	n.becomeFollower(a.Term)
-	n.leader = a.LeaderID
+	n.leader, n.leaderLive = a.LeaderID, true
 	n.resetElectionTimer()
 
 	// Entries at or below our snapshot are committed and identical to the
@@ -518,6 +635,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 	if n.role != Leader || r.Term != n.currentTerm {
 		return
 	}
+	n.markActive(from)
 	if r.Success {
 		n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 		n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
@@ -555,7 +673,7 @@ func (n *Node) handleInstallSnapshot(from NodeID, a InstallSnapshotArgs) {
 		return
 	}
 	n.becomeFollower(a.Term)
-	n.leader = a.LeaderID
+	n.leader, n.leaderLive = a.LeaderID, true
 	n.resetElectionTimer()
 
 	if a.LastIncludedIndex <= n.commitIndex { // we already have all of it
@@ -586,6 +704,7 @@ func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
 	if n.role != Leader || r.Term != n.currentTerm {
 		return
 	}
+	n.markActive(from)
 	n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 	n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
 	n.advanceCommit()

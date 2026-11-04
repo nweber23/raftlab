@@ -85,7 +85,7 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int) error {
 	store := kv.New()
 	node, err := raft.New(raft.Config{
 		ID: id, Peers: ids, Initial: initial, Storage: wal, Machine: store,
-		Clock: clock.System{}, Transport: tr, SnapshotThreshold: snapThreshold,
+		Clock: clock.System{}, Transport: tr, SnapshotThreshold: snapThreshold, PreVote: true, CheckQuorum: true,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
 		Rand:              rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(id))),

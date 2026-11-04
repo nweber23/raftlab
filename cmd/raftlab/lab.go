@@ -105,7 +105,7 @@ func (l *Lab) start(id raft.NodeID) error {
 	store := kv.New()
 	node, err := raft.New(raft.Config{
 		ID: id, Peers: l.ids, Initial: initial, Storage: wal, Machine: store,
-		Clock: clock.System{}, Transport: l.net, SnapshotThreshold: 40,
+		Clock: clock.System{}, Transport: l.net, SnapshotThreshold: 40, PreVote: true, CheckQuorum: true,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
 		Rand:              rand.New(rand.NewPCG(uint64(time.Now().UnixNano())+l.boots, uint64(id))),
@@ -279,8 +279,14 @@ func describe(e transport.Event) MsgEvent {
 	switch b := m.Body.(type) {
 	case raft.RequestVoteArgs:
 		ev.Detail = fmt.Sprintf("last log %d@%d", b.LastLogIndex, b.LastLogTerm)
+		if b.PreVote {
+			ev.Detail = "pre-vote " + ev.Detail
+		}
 	case raft.RequestVoteReply:
 		ev.Detail = fmt.Sprintf("granted=%v", b.VoteGranted)
+		if b.PreVote {
+			ev.Detail = "pre-vote " + ev.Detail
+		}
 	case raft.AppendEntriesArgs:
 		ev.Detail = fmt.Sprintf("prev=%d entries=%d commit=%d", b.PrevLogIndex, len(b.Entries), b.LeaderCommit)
 	case raft.AppendEntriesReply:

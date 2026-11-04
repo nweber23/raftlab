@@ -46,12 +46,18 @@ type RequestVoteArgs struct {
 	CandidateID  NodeID
 	LastLogIndex uint64
 	LastLogTerm  uint64
+	// PreVote marks a probe (thesis §9.6): Term is the term the sender would
+	// campaign in, but nobody changes state, so a node that cannot win never
+	// inflates anyone's term.
+	PreVote bool
 }
 
-// RequestVoteReply is the RequestVote RPC response (Figure 2).
+// RequestVoteReply is the RequestVote RPC response (Figure 2). For a granted
+// PreVote, Term echoes the probed term.
 type RequestVoteReply struct {
 	Term        uint64
 	VoteGranted bool
+	PreVote     bool
 }
 
 // AppendEntriesArgs is the AppendEntries RPC request (Figure 2).

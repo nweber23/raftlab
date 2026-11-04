@@ -67,6 +67,9 @@ func (r *Recorder) Applied() []Applied {
 type Options struct {
 	Size int
 	Seed uint64
+	// Classic turns PreVote and CheckQuorum off (they are on by default), for
+	// tests that demonstrate what they prevent.
+	Classic bool
 	// SnapshotThreshold is passed to every node (0 disables compaction).
 	SnapshotThreshold int
 	// Machine builds the state machine for a node; nil gives each node a Recorder.
@@ -128,7 +131,8 @@ func (c *Cluster) boot(id raft.NodeID) {
 		ID: id, Peers: c.IDs, Initial: initial, Storage: wal,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
-		Clock:             c.Clock, Transport: c.Net, Machine: sm, SnapshotThreshold: c.Opts.SnapshotThreshold,
+		PreVote:           !c.Opts.Classic, CheckQuorum: !c.Opts.Classic,
+		Clock: c.Clock, Transport: c.Net, Machine: sm, SnapshotThreshold: c.Opts.SnapshotThreshold,
 		Rand: rand.New(rand.NewPCG(c.Opts.Seed+c.restarts[id], uint64(id))),
 	})
 	if err != nil {
