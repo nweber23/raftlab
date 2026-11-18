@@ -3,6 +3,7 @@ package raft
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"slices"
 )
 
@@ -13,6 +14,9 @@ import (
 type Membership struct {
 	Voters []NodeID `json:"voters"`
 	Old    []NodeID `json:"old,omitempty"`
+	// Addrs optionally maps servers to network addresses, so the transport can
+	// learn peers from the log. The core never interprets them.
+	Addrs map[NodeID]string `json:"addrs,omitempty"`
 }
 
 // Joint reports whether c is a joint configuration.
@@ -76,6 +80,24 @@ var (
 // Calling again while still catching up replaces the target, which is how a
 // change stuck on a dead newcomer is abandoned.
 func (n *Node) ChangeMembership(voters []NodeID) (uint64, error) {
+	return n.change(voters, nil)
+}
+
+// ChangeMembershipAddrs is ChangeMembership for a cluster whose configuration
+// carries addresses: the new voters are the keys of addrs, and the addresses
+// travel in the configuration entries (and reach Config.OnAddrs).
+func (n *Node) ChangeMembershipAddrs(addrs map[NodeID]string) (uint64, error) {
+	voters := make([]NodeID, 0, len(addrs))
+	for id, a := range addrs {
+		if a == "" {
+			return 0, ErrBadConfig
+		}
+		voters = append(voters, id)
+	}
+	return n.change(voters, addrs)
+}
+
+func (n *Node) change(voters []NodeID, addrs map[NodeID]string) (uint64, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped || n.role != Leader {
@@ -94,13 +116,16 @@ func (n *Node) ChangeMembership(voters []NodeID) (uint64, error) {
 	if n.termAt(n.commitIndex) != n.currentTerm {
 		return 0, ErrNotReady
 	}
-	n.target, n.learners = voters, map[NodeID]bool{}
+	n.target, n.targetAddrs, n.learners = voters, addrs, map[NodeID]bool{}
 	for _, id := range voters {
 		if !n.conf.Has(id) {
 			n.learners[id] = true
 		}
 	}
 	n.syncProgress()
+	if n.cfg.OnAddrs != nil && addrs != nil {
+		n.cfg.OnAddrs(mergeAddrs(n.conf.Addrs, addrs)) // learners must be reachable before they are members
+	}
 	if idx := n.promote(); idx != 0 {
 		return idx, nil
 	}
@@ -119,8 +144,8 @@ func (n *Node) promote() uint64 {
 			return 0
 		}
 	}
-	idx := n.appendConfig(Membership{Voters: n.target, Old: n.conf.Voters})
-	n.target, n.learners = nil, nil
+	idx := n.appendConfig(Membership{Voters: n.target, Old: n.conf.Voters, Addrs: mergeAddrs(n.conf.Addrs, n.targetAddrs)})
+	n.target, n.targetAddrs, n.learners = nil, nil, nil
 	n.replicate()
 	return idx
 }
@@ -157,6 +182,7 @@ func (n *Node) appendConfig(c Membership) uint64 {
 	n.persistAppend(n.lastIndex()-1, n.entries(n.lastIndex()-1, n.lastIndex()))
 	n.matchIndex[n.cfg.ID] = n.lastIndex()
 	n.conf, n.confIndex = c, n.lastIndex()
+	n.notifyAddrs()
 	n.syncProgress()
 	n.advanceCommit()
 	return n.confIndex
@@ -176,7 +202,42 @@ func (n *Node) configAt(idx uint64) (Membership, uint64) {
 // underneath it (truncation, snapshot install, restart).
 func (n *Node) refreshConfig() {
 	n.conf, n.confIndex = n.configAt(n.lastIndex())
+	n.notifyAddrs()
 	n.syncProgress()
+}
+
+func (n *Node) notifyAddrs() {
+	if n.cfg.OnAddrs != nil && len(n.conf.Addrs) > 0 {
+		n.cfg.OnAddrs(n.conf.Addrs)
+	}
+}
+
+// mergeAddrs returns a new map: old overlaid with add. Maps are never mutated
+// because Membership values are shared with callers of Status.
+func mergeAddrs(old, add map[NodeID]string) map[NodeID]string {
+	if len(old)+len(add) == 0 {
+		return nil
+	}
+	m := maps.Clone(old)
+	if m == nil {
+		m = map[NodeID]string{}
+	}
+	maps.Copy(m, add)
+	return m
+}
+
+// keepAddrs returns the addresses of ids only.
+func keepAddrs(a map[NodeID]string, ids []NodeID) map[NodeID]string {
+	var m map[NodeID]string
+	for _, id := range ids {
+		if v, ok := a[id]; ok {
+			if m == nil {
+				m = map[NodeID]string{}
+			}
+			m[id] = v
+		}
+	}
+	return m
 }
 
 // syncProgress gives a leader replication state for peers that just joined.
@@ -204,7 +265,7 @@ func (n *Node) afterCommit() {
 		// ponytail: a leader that removes itself, or a crashed removed server,
 		// is not covered; PreVote and the lease still keep those out.
 		gone := n.conf.Old
-		n.appendConfig(Membership{Voters: n.conf.Voters})
+		n.appendConfig(Membership{Voters: n.conf.Voters, Addrs: keepAddrs(n.conf.Addrs, n.conf.Voters)})
 		n.departing = map[NodeID]bool{}
 		for _, id := range gone {
 			if !n.conf.Has(id) && id != n.cfg.ID {

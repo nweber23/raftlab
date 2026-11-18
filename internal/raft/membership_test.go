@@ -2,6 +2,7 @@ package raft_test
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -364,5 +365,35 @@ func TestRemovedServerLearnsItIsRemoved(t *testing.T) {
 	changeTo(c, keep)
 	if !c.RunUntil(3*time.Second, func() bool { return !c.Nodes[gone].Status().Config.Has(gone) }) {
 		c.Fatalf("removed server %d never learned it was removed: %+v", gone, c.Nodes[gone].Status().Config)
+	}
+}
+
+// Addresses ride in the configuration entries: every member, the newcomer
+// included, learns them from the log, and they survive a restart.
+func TestConfigCarriesAddresses(t *testing.T) {
+	c := raftest.NewCluster(t, raftest.Options{Size: 3, Seed: 70})
+	c.WaitLeader()
+	c.Run(500 * time.Millisecond)
+	c.AddNode(4)
+	addrs := map[raft.NodeID]string{1: "h1:1", 2: "h2:2", 3: "h3:3", 4: "h4:4"}
+	for !func() bool {
+		l := c.WaitLeader()
+		_, err := c.Nodes[l].ChangeMembershipAddrs(addrs)
+		return err == nil
+	}() {
+		c.Run(100 * time.Millisecond)
+	}
+	if !c.RunUntil(10*time.Second, func() bool { return settled(c, ids{1, 2, 3, 4}) }) {
+		c.Fatalf("never settled")
+	}
+	c.Crash(4)
+	c.Restart(4)
+	for _, id := range c.IDs {
+		if got := c.Nodes[id].Status().Config.Addrs; !maps.Equal(got, addrs) {
+			c.Fatalf("node %d addrs %v", id, got)
+		}
+	}
+	if _, err := c.Nodes[c.WaitLeader()].ChangeMembershipAddrs(map[raft.NodeID]string{1: ""}); err != raft.ErrBadConfig {
+		c.Fatalf("empty address accepted: %v", err)
 	}
 }

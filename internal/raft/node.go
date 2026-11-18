@@ -15,6 +15,13 @@ type Config struct {
 	// otherwise. A server joining an existing cluster leaves it empty: it
 	// stays passive until the leader replicates a configuration to it.
 	Peers []NodeID
+	// Addrs optionally gives the initial members' addresses (see
+	// Membership.Addrs). OnAddrs, if set, is called, with the node locked and
+	// so without calling back into it, whenever the set of known addresses
+	// grows or changes: at start, on every configuration change, and when a
+	// new server starts to receive the log. It receives the full current map.
+	Addrs   map[NodeID]string
+	OnAddrs func(map[NodeID]string)
 
 	ElectionTimeoutMin time.Duration // paper §5.2 suggests 150ms
 	ElectionTimeoutMax time.Duration // paper §5.2 suggests 300ms
@@ -83,8 +90,9 @@ type Node struct {
 
 	// Leader only: a membership change waiting for its new servers to catch
 	// up. learners receive the log but are in no configuration yet.
-	target   []NodeID
-	learners map[NodeID]bool
+	target      []NodeID
+	targetAddrs map[NodeID]string
+	learners    map[NodeID]bool
 
 	// Leader only: servers just removed that still need C(new) delivered.
 	departing map[NodeID]bool
@@ -143,7 +151,7 @@ func New(cfg Config) (*Node, error) {
 		snapConf: cfg.Initial.SnapConf,
 	}
 	if n.snapConf.Voters == nil { // nothing durable yet: bootstrap from Peers
-		n.snapConf = Membership{Voters: normalize(cfg.Peers)}
+		n.snapConf = Membership{Voters: normalize(cfg.Peers), Addrs: cfg.Addrs}
 	}
 	n.refreshConfig()
 	if n.snapIndex > 0 {
@@ -333,7 +341,7 @@ func (n *Node) becomeFollower(term uint64) {
 		n.persistState()
 	}
 	n.role, n.votes, n.preVoting, n.active = Follower, nil, false, nil
-	n.target, n.learners, n.departing = nil, nil, nil
+	n.target, n.targetAddrs, n.learners, n.departing = nil, nil, nil, nil
 	if wasLeader {
 		n.leader = NoNode
 		n.failReads()
