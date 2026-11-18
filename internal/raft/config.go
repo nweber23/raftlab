@@ -144,6 +144,9 @@ func (n *Node) peers() []NodeID {
 	for id := range n.learners {
 		all = append(all, id)
 	}
+	for id := range n.departing {
+		all = append(all, id)
+	}
 	slices.Sort(all)
 	return slices.DeleteFunc(all, func(id NodeID) bool { return id == n.cfg.ID })
 }
@@ -196,9 +199,29 @@ func (n *Node) afterCommit() {
 	}
 	switch {
 	case n.conf.Joint():
+		// Servers leaving only have C(old,new), which still lists them. Keep
+		// sending to them until they hold C(new) and know they are gone.
+		// ponytail: a leader that removes itself, or a crashed removed server,
+		// is not covered; PreVote and the lease still keep those out.
+		gone := n.conf.Old
 		n.appendConfig(Membership{Voters: n.conf.Voters})
+		n.departing = map[NodeID]bool{}
+		for _, id := range gone {
+			if !n.conf.Has(id) && id != n.cfg.ID {
+				n.departing[id] = true
+			}
+		}
 		n.replicate()
 	case !n.conf.Has(n.cfg.ID):
 		n.becomeFollower(n.currentTerm)
+	}
+}
+
+// dropDeparted stops sending to removed servers that now hold C(new).
+func (n *Node) dropDeparted() {
+	for id := range n.departing {
+		if n.matchIndex[id] >= n.confIndex {
+			delete(n.departing, id)
+		}
 	}
 }

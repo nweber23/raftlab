@@ -86,6 +86,9 @@ type Node struct {
 	target   []NodeID
 	learners map[NodeID]bool
 
+	// Leader only: servers just removed that still need C(new) delivered.
+	departing map[NodeID]bool
+
 	// Leader only, reinitialized on election (Figure 2).
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
@@ -330,7 +333,7 @@ func (n *Node) becomeFollower(term uint64) {
 		n.persistState()
 	}
 	n.role, n.votes, n.preVoting, n.active = Follower, nil, false, nil
-	n.target, n.learners = nil, nil
+	n.target, n.learners, n.departing = nil, nil, nil
 	if wasLeader {
 		n.leader = NoNode
 		n.failReads()
@@ -756,6 +759,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 		n.replicating[from] = true
 		n.advanceCommit()
 		n.promote()
+		n.dropDeparted()
 		if n.nextIndex[from] <= n.lastIndex() {
 			n.sendAppend(from) // more to ship
 		}
@@ -875,6 +879,7 @@ func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
 	n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
 	n.advanceCommit()
 	n.promote()
+	n.dropDeparted()
 	if n.nextIndex[from] <= n.lastIndex() {
 		n.sendAppend(from)
 	}

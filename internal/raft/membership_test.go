@@ -343,3 +343,26 @@ func TestUnreachableNewcomersDoNotStallCommits(t *testing.T) {
 		c.Fatalf("change never completed after healing")
 	}
 }
+
+// A server removed by the change must learn that it is gone: the leader has to
+// deliver C(new) to it even though it is no longer a member, or it keeps
+// believing it belongs (and keeps trying to campaign) on C(old,new).
+func TestRemovedServerLearnsItIsRemoved(t *testing.T) {
+	c := raftest.NewCluster(t, raftest.Options{Size: 3, Seed: 69})
+	l := c.WaitLeader()
+	c.Run(500 * time.Millisecond)
+	var gone raft.NodeID
+	keep := ids{l}
+	for _, id := range c.IDs {
+		if id != l && gone == raft.NoNode {
+			gone = id
+		} else if id != l {
+			keep = append(keep, id)
+		}
+	}
+	slices.Sort(keep)
+	changeTo(c, keep)
+	if !c.RunUntil(3*time.Second, func() bool { return !c.Nodes[gone].Status().Config.Has(gone) }) {
+		c.Fatalf("removed server %d never learned it was removed: %+v", gone, c.Nodes[gone].Status().Config)
+	}
+}

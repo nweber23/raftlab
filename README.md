@@ -120,7 +120,6 @@ A failure message always begins with `seed=N`.
 Everything from the original roadmap is done; see [rundown.md](rundown.md) for what was built and what it showed. What is left:
 
 - Membership changes in `raftnode`: configuration entries would need to carry addresses, and the HTTP transport would learn peers at runtime
-- Telling removed servers they are gone (today they are only kept out by PreVote and the leader lease)
 - Leader leases as a cheaper alternative to ReadIndex, if a trustworthy clock bound is available
 
 ## License
