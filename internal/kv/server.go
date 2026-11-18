@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,11 @@ import (
 //	POST   /session    register: the body of the reply is a new client ID
 //	POST   /keepalive  refresh the session named by X-Client-ID
 //	GET    /status
+//	POST   /membership body = JSON {"1":"host:port",...}: the new server set
+//
+// /membership is disabled unless AdminToken is set, and then needs it as a
+// bearer token; it is answered 202 once the leader accepts the change (poll
+// /status for "config" to see it finish).
 //
 // Writes carry X-Client-ID and X-Request-ID (a per-client increasing number);
 // a retry with the same pair is applied once. Requests to a follower get a
@@ -31,6 +37,8 @@ type Server struct {
 	// LeaderURL maps a node ID to the base URL clients should use for it;
 	// "" means unknown.
 	LeaderURL func(raft.NodeID) string
+	// AdminToken guards POST /membership; empty disables the endpoint.
+	AdminToken string
 	// Timeout bounds how long a request waits for its commit.
 	Timeout time.Duration
 }
@@ -44,7 +52,46 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /session", s.serveKV(OpRegister))
 	mux.HandleFunc("POST /keepalive", s.serveKV(OpKeepAlive))
 	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("POST /membership", s.membership)
 	return mux
+}
+
+func (s *Server) membership(w http.ResponseWriter, r *http.Request) {
+	if s.AdminToken == "" {
+		http.Error(w, "membership changes are disabled (no admin token configured)", http.StatusForbidden)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+s.AdminToken)) != 1 {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var in map[string]string
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	addrs := map[raft.NodeID]string{}
+	for k, a := range in {
+		id, err := strconv.ParseUint(k, 10, 32)
+		if err != nil || id == 0 {
+			http.Error(w, "bad node id "+strconv.Quote(k), http.StatusBadRequest)
+			return
+		}
+		addrs[raft.NodeID(id)] = a
+	}
+	switch _, err := s.Node.ChangeMembershipAddrs(addrs); {
+	case err == nil:
+		w.WriteHeader(http.StatusAccepted)
+	case errors.Is(err, raft.ErrNotLeader):
+		s.redirect(w, r)
+	case errors.Is(err, raft.ErrBadConfig):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, raft.ErrConfigPending):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default: // ErrNotReady: a new leader that has not committed yet
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
 }
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
@@ -52,7 +99,7 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	st.Log = nil
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"id": st.ID, "role": st.Role.String(), "term": st.Term,
-		"leader": st.Leader, "commitIndex": st.CommitIndex, "lastApplied": st.LastApplied, "lastIndex": st.LastIndex})
+		"leader": st.Leader, "config": st.Config, "commitIndex": st.CommitIndex, "lastApplied": st.LastApplied, "lastIndex": st.LastIndex})
 }
 
 func (s *Server) serveKV(kind string) http.HandlerFunc {

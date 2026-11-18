@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nweber23/raftlab/internal/clock"
@@ -43,6 +44,7 @@ func main() {
 	data := flag.String("data", "data", "directory for the write-ahead log (a subdirectory per node ID)")
 	snap := flag.Int("snapshot-threshold", 1000, "compact the log after this many applied entries (0 = never)")
 	ttl := flag.Duration("session-ttl", 0, "forget client sessions idle this long (0 = never)")
+	join := flag.Bool("join", false, "start as a new server for an existing cluster: -peers lists current members (and this node); the leader adds it via POST /membership")
 	require := flag.Bool("require-sessions", false, "reject writes whose X-Client-ID was not issued by POST /session")
 	var tf tlsFiles
 	flag.StringVar(&tf.ca, "tls-ca", "", "CA certificate (PEM) that signs every node's certificate; enables mutual TLS")
@@ -50,7 +52,7 @@ func main() {
 	flag.StringVar(&tf.key, "tls-key", "", "this node's private key (PEM)")
 	flag.Parse()
 
-	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), os.Getenv("RAFTLAB_TOKEN"), *snap, tf, kv.SessionOptions{TTL: *ttl, Require: *require}); err != nil {
+	if err := run(raft.NodeID(*id), *peerList, filepath.Join(*data, fmt.Sprint(*id)), os.Getenv("RAFTLAB_TOKEN"), *snap, tf, *join, kv.SessionOptions{TTL: *ttl, Require: *require}); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -68,7 +70,7 @@ func parsePeers(s string) (map[raft.NodeID]string, error) {
 	return peers, nil
 }
 
-func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsFiles, sessions kv.SessionOptions) error {
+func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsFiles, join bool, sessions kv.SessionOptions) error {
 	addrs, err := parsePeers(peerList)
 	if err != nil {
 		return err
@@ -91,6 +93,7 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsF
 		scheme = "https://"
 	}
 	var ids []raft.NodeID
+	var mu sync.Mutex
 	urls := map[raft.NodeID]string{}
 	others := map[raft.NodeID]string{}
 	for p, a := range addrs {
@@ -99,6 +102,10 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsF
 		if p != id {
 			others[p] = urls[p]
 		}
+	}
+	peerIDs := ids
+	if join {
+		peerIDs = nil // a joining server has no configuration until the leader sends one
 	}
 
 	wal, initial, err := storage.Open(dir, storage.Options{})
@@ -110,8 +117,24 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsF
 	defer tr.Close()
 	store := kv.New()
 	store.SessionTTL, store.RequireSessions = sessions.TTL, sessions.Require
+	// The log carries every member's address; the transport and the redirect
+	// table learn peers from it as the membership changes.
+	onAddrs := func(a map[raft.NodeID]string) {
+		fresh := map[raft.NodeID]string{}
+		for p, addr := range a {
+			if p != id {
+				fresh[p] = scheme + addr
+			}
+		}
+		tr.SetPeers(fresh)
+		mu.Lock()
+		defer mu.Unlock()
+		for p, addr := range a {
+			urls[p] = scheme + addr
+		}
+	}
 	node, err := raft.New(raft.Config{
-		ID: id, Peers: ids, Initial: initial, Storage: wal, Machine: store,
+		ID: id, Peers: peerIDs, Addrs: addrs, OnAddrs: onAddrs, Initial: initial, Storage: wal, Machine: store,
 		Clock: clock.System{}, Transport: tr, SnapshotThreshold: snapThreshold, PreVote: true, CheckQuorum: true,
 		ElectionTimeoutMin: 150 * time.Millisecond, ElectionTimeoutMax: 300 * time.Millisecond,
 		HeartbeatInterval: 50 * time.Millisecond,
@@ -123,8 +146,12 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsF
 	store.Attach(node)
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /raft", transport.Handler(id, ids, token, node.Handle, peerCert...))
-	api := &kv.Server{Store: store, Node: node, LeaderURL: func(l raft.NodeID) string { return urls[l] }}
+	mux.Handle("POST /raft", transport.Handler(id, nil, token, node.Handle, append(peerCert, transport.KnownPeers(tr.Knows))...))
+	api := &kv.Server{Store: store, Node: node, AdminToken: token, LeaderURL: func(l raft.NodeID) string {
+		mu.Lock()
+		defer mu.Unlock()
+		return urls[l]
+	}}
 	mux.Handle("/", api.Handler())
 	srv := &http.Server{Addr: self, Handler: mux, TLSConfig: serverTLS}
 
