@@ -1,6 +1,10 @@
 // Package storage implements raft.Storage as a write-ahead log.
 //
-// The log is a single file of records:
+// The file starts with an 8-byte header, "RAFTWAL" and a version byte, then
+// holds records. A file without the header (written before versioning) is read
+// as version 1 and gains the header the next time it is compacted. The magic
+// read as a record length exceeds maxRecord, so the two cannot be confused.
+//
 //
 //	| length u32 | crc32c u32 | type u8 | payload ... |
 //
@@ -31,6 +35,8 @@ const (
 	recSnapshot byte = 3 // index u64, term u64, conf len u32, conf JSON, data
 
 	headerSize = 8
+	fileMagic  = "RAFTWAL"
+	fileVer    = 1
 	maxRecord  = 1 << 30 // sanity bound so a corrupt length cannot trigger a huge allocation
 )
 
@@ -67,10 +73,22 @@ func Open(dir string, opts Options) (*WAL, raft.PersistentState, error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, st, err
 	}
-	st, good, err := replay(data)
+	hdr, err := fileHeader(data)
 	if err != nil {
 		return nil, st, fmt.Errorf("storage: %s: %w", w.path, err)
 	}
+	if hdr < 0 { // new or torn-header file: start over with a header
+		data = header()
+		hdr = len(data)
+		if err := os.WriteFile(w.path, data, 0o644); err != nil {
+			return nil, st, err
+		}
+	}
+	st, good, err := replay(data[hdr:])
+	if err != nil {
+		return nil, st, fmt.Errorf("storage: %s: %w", w.path, err)
+	}
+	good += hdr
 	w.term, w.votedFor = st.Term, st.VotedFor
 
 	if w.f, err = os.OpenFile(w.path, os.O_RDWR|os.O_CREATE, 0o644); err != nil {
@@ -88,6 +106,27 @@ func Open(dir string, opts Options) (*WAL, raft.PersistentState, error) {
 		return nil, st, err
 	}
 	return w, st, nil
+}
+
+func header() []byte { return append([]byte(fileMagic), fileVer) }
+
+// fileHeader returns the length of data's header: 0 for a legacy file, 8 for a
+// current one, -1 for an empty file or one that tore while writing its header.
+func fileHeader(data []byte) (int, error) {
+	h := header()
+	if len(data) < len(h) {
+		if string(data) == string(h[:len(data)]) {
+			return -1, nil
+		}
+		return 0, nil
+	}
+	if string(data[:len(fileMagic)]) != fileMagic {
+		return 0, nil
+	}
+	if data[len(fileMagic)] != fileVer {
+		return 0, fmt.Errorf("unsupported WAL version %d", data[len(fileMagic)])
+	}
+	return len(h), nil
 }
 
 // replay rebuilds state from data and returns the length of the valid prefix.
@@ -239,6 +278,7 @@ func (w *WAL) SaveSnapshot(s raft.Snapshot, tail []raft.Entry) error {
 		return err
 	}
 	var buf []byte
+	buf = append(buf, header()...)
 	buf = append(buf, stateRecord(w.term, w.votedFor)...)
 	buf = append(buf, snapshotRecord(s)...)
 	buf = append(buf, appendRecord(s.Index, tail)...)

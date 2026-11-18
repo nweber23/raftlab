@@ -122,7 +122,6 @@ Everything from the original roadmap is done; see [rundown.md](rundown.md) for w
 - Membership changes in `raftnode`: configuration entries would need to carry addresses, and the HTTP transport would learn peers at runtime
 - A non-voting catch-up phase for new servers, so adding one that is far behind cannot stall commits
 - Telling removed servers they are gone (today they are only kept out by PreVote and the leader lease)
-- Versioned WAL records, so a format change does not strand an old data directory
 - Leader leases as a cheaper alternative to ReadIndex, if a trustworthy clock bound is available
 
 ## License

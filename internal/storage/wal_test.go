@@ -171,3 +171,51 @@ func TestConfigEntriesAndSnapshotMembershipRoundTrip(t *testing.T) {
 		t.Fatalf("log: %+v", st.Log)
 	}
 }
+
+func TestFileHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "raft.wal")
+	w, _ := mustOpen(t, dir)
+	w.Append(0, []raft.Entry{e(1, "x")})
+	w.Close()
+	cur, _ := os.ReadFile(path)
+	if string(cur[:7]) != "RAFTWAL" {
+		t.Fatalf("no header: %q", cur[:8])
+	}
+
+	// A legacy (headerless) file still opens, and keeps working when appended to.
+	if err := os.WriteFile(path, cur[8:], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, st := mustOpen(t, dir)
+	if len(st.Log) != 1 {
+		t.Fatalf("legacy log %+v", st.Log)
+	}
+	w.Append(1, []raft.Entry{e(1, "y")})
+	w.Close()
+	if _, st = mustOpen2(t, dir); len(st.Log) != 2 {
+		t.Fatalf("after legacy append %+v", st.Log)
+	}
+
+	// A newer version is refused rather than misread.
+	bad := append([]byte(nil), cur...)
+	bad[7] = 99
+	os.WriteFile(path, bad, 0o644)
+	if _, _, err := Open(dir, Options{}); err == nil {
+		t.Fatal("unknown version accepted")
+	}
+
+	// A header torn mid-write is just an empty log.
+	os.WriteFile(path, cur[:3], 0o644)
+	w, st = mustOpen(t, dir)
+	defer w.Close()
+	if len(st.Log) != 0 {
+		t.Fatalf("torn header %+v", st.Log)
+	}
+}
+
+func mustOpen2(t *testing.T, dir string) (*WAL, raft.PersistentState) {
+	w, st := mustOpen(t, dir)
+	w.Close()
+	return w, st
+}
