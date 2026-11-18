@@ -69,7 +69,16 @@ See the [security notes](docs/design-decisions.md#security-model) for what this 
 
 ### Changing the cluster
 
-Membership changes are a core feature (`Node.ChangeMembership`) and drive the visualizer's **Scale** control, which adds and removes servers live. The standalone `raftnode` binary has a fixed address list, so it does not expose them yet (see the roadmap).
+Membership changes drive the visualizer's **Scale** control, and `raftnode` exposes them too. Start the newcomer with `-join` (`-peers` lists the current members plus itself), then tell the cluster the new server set. The endpoint needs `RAFTLAB_TOKEN` as a bearer token and is disabled without one; followers redirect to the leader (`--location-trusted` keeps the header).
+
+```sh
+RAFTLAB_TOKEN=secret bin/raftnode -id 4 -join -peers $P,4=127.0.0.1:7004 -data data &
+curl --location-trusted -X POST -H 'Authorization: Bearer secret' \
+  -d '{"1":"127.0.0.1:7001","2":"127.0.0.1:7002","3":"127.0.0.1:7003","4":"127.0.0.1:7004"}' 127.0.0.1:7001/membership
+curl 127.0.0.1:7004/status    # "config" shows the voters once the change commits
+```
+
+The newcomer first catches up as a non-voting learner, so the change does not stall writes. Removing a server is the same call with that server left out.
 
 ## Architecture
 
@@ -117,9 +126,8 @@ A failure message always begins with `seed=N`.
 
 ## Roadmap
 
-Everything from the original roadmap is done; see [rundown.md](rundown.md) for what was built and what it showed. What is left:
+Everything planned is done; see [rundown.md](rundown.md) for the first round of work. What is left, deliberately:
 
-- Membership changes in `raftnode`: configuration entries would need to carry addresses, and the HTTP transport would learn peers at runtime
 - Leader leases as a cheaper alternative to ReadIndex, if a trustworthy clock bound is available
 
 ## License
