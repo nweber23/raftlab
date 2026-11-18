@@ -69,10 +69,10 @@ See the [security notes](docs/design-decisions.md#security-model) for what this 
 
 ### Changing the cluster
 
-Membership changes drive the visualizer's **Scale** control, and `raftnode` exposes them too. Start the newcomer with `-join` (`-peers` lists the current members plus itself), then tell the cluster the new server set. The endpoint needs `RAFTLAB_TOKEN` as a bearer token and is disabled without one; followers redirect to the leader (`--location-trusted` keeps the header).
+Membership changes drive the visualizer's **Scale** control, and `raftnode` exposes them too. Start the newcomer with `-join` (`-peers` lists the current members plus itself), then tell the cluster the new server set. The endpoint needs `RAFTLAB_ADMIN_TOKEN` (a separate secret from the peer token) as a bearer token and is disabled when it is unset; followers redirect to the leader (`--location-trusted` keeps the header).
 
 ```sh
-RAFTLAB_TOKEN=secret bin/raftnode -id 4 -join -peers $P,4=127.0.0.1:7004 -data data &
+RAFTLAB_ADMIN_TOKEN=secret bin/raftnode -id 4 -join -peers $P,4=127.0.0.1:7004 -data data &
 curl --location-trusted -X POST -H 'Authorization: Bearer secret' \
   -d '{"1":"127.0.0.1:7001","2":"127.0.0.1:7002","3":"127.0.0.1:7003","4":"127.0.0.1:7004"}' 127.0.0.1:7001/membership
 curl 127.0.0.1:7004/status    # "config" shows the voters once the change commits

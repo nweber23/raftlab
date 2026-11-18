@@ -44,7 +44,7 @@ func TestProcessesChangeMembership(t *testing.T) {
 	start := func(id int, extra ...string) {
 		args := append([]string{"-id", fmt.Sprint(id), "-data", filepath.Join(dir, "data")}, extra...)
 		cmd := exec.Command(bin, args...)
-		cmd.Env = append(os.Environ(), "RAFTLAB_TOKEN=tok")
+		cmd.Env = append(os.Environ(), "RAFTLAB_TOKEN=tok", "RAFTLAB_ADMIN_TOKEN=adm")
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +62,7 @@ func TestProcessesChangeMembership(t *testing.T) {
 	}}
 	do := func(method string, id int, path, body string) (int, string) {
 		req, _ := http.NewRequest(method, "http://"+addr[id]+path, strings.NewReader(body))
-		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set("Authorization", "Bearer adm")
 		resp, err := client.Do(req)
 		if err != nil {
 			return 0, err.Error()
@@ -96,6 +96,11 @@ func TestProcessesChangeMembership(t *testing.T) {
 		_, b := do("GET", 1, "/status", "")
 		return strings.Contains(b, `"voters":[2,3,4]`)
 	})
+	req, _ := http.NewRequest("POST", "http://"+addr[2]+"/membership", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer tok") // the peer token must not work here
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("peer token accepted for membership: %v %v", resp, err)
+	}
 	if c, _ := do("POST", 2, "/membership", "{}"); c != http.StatusBadRequest {
 		t.Fatalf("empty membership: %d", c)
 	}

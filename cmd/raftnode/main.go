@@ -7,6 +7,9 @@
 // If $RAFTLAB_TOKEN is set, peers must present it on /raft. It is read from
 // the environment only, so it never appears in the process list.
 //
+// POST /membership is disabled unless $RAFTLAB_ADMIN_TOKEN is set; it is a
+// different secret from the peer token, which every node holds.
+//
 // With -tls-ca, -tls-cert and -tls-key the node serves HTTPS and peers
 // authenticate each other with certificates (see cmd/raftcert): /raft accepts
 // a message only from a peer whose verified certificate is named for the
@@ -147,7 +150,7 @@ func run(id raft.NodeID, peerList, dir, token string, snapThreshold int, tf tlsF
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /raft", transport.Handler(id, nil, token, node.Handle, append(peerCert, transport.KnownPeers(tr.Knows))...))
-	api := &kv.Server{Store: store, Node: node, AdminToken: token, LeaderURL: func(l raft.NodeID) string {
+	api := &kv.Server{Store: store, Node: node, AdminToken: os.Getenv("RAFTLAB_ADMIN_TOKEN"), LeaderURL: func(l raft.NodeID) string {
 		mu.Lock()
 		defer mu.Unlock()
 		return urls[l]

@@ -37,7 +37,8 @@ type Server struct {
 	// LeaderURL maps a node ID to the base URL clients should use for it;
 	// "" means unknown.
 	LeaderURL func(raft.NodeID) string
-	// AdminToken guards POST /membership; empty disables the endpoint.
+	// AdminToken guards POST /membership; empty disables the endpoint. It
+	// should not be the peer-RPC secret, which every node holds.
 	AdminToken string
 	// Timeout bounds how long a request waits for its commit.
 	Timeout time.Duration
