@@ -5,7 +5,6 @@
 // as version 1 and gains the header the next time it is compacted. The magic
 // read as a record length exceeds maxRecord, so the two cannot be confused.
 //
-//
 //	| length u32 | crc32c u32 | type u8 | payload ... |
 //
 // length covers type+payload and the checksum covers the same bytes. A crash

@@ -68,10 +68,13 @@ var (
 // ConfigIndex <= CommitIndex. A leader that is not in voters steps down once
 // C(new) commits.
 //
-// New servers should be started first (with no Peers) so they can catch up;
-// they count towards quorum as soon as C(old,new) is appended.
-// ponytail: no learner phase, so adding a server far behind the log can stall
-// commits until it catches up; add non-voting catch-up if that matters.
+// New servers should be started first (with no Peers). A server that is not
+// yet in the configuration first receives the log as a non-voting learner, and
+// C(old,new) is appended only once every such server has caught up to the
+// commit index, so a far-behind newcomer cannot stall commits. In that case the
+// returned index is 0 and the change is learned of through Status as before.
+// Calling again while still catching up replaces the target, which is how a
+// change stuck on a dead newcomer is abandoned.
 func (n *Node) ChangeMembership(voters []NodeID) (uint64, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -91,9 +94,35 @@ func (n *Node) ChangeMembership(voters []NodeID) (uint64, error) {
 	if n.termAt(n.commitIndex) != n.currentTerm {
 		return 0, ErrNotReady
 	}
-	idx := n.appendConfig(Membership{Voters: voters, Old: n.conf.Voters})
+	n.target, n.learners = voters, map[NodeID]bool{}
+	for _, id := range voters {
+		if !n.conf.Has(id) {
+			n.learners[id] = true
+		}
+	}
+	n.syncProgress()
+	if idx := n.promote(); idx != 0 {
+		return idx, nil
+	}
 	n.replicate()
-	return idx, nil
+	return 0, nil
+}
+
+// promote appends C(old,new) once every learner has caught up to the commit
+// index, and returns its index (0 if it is still waiting).
+func (n *Node) promote() uint64 {
+	if n.target == nil {
+		return 0
+	}
+	for id := range n.learners {
+		if n.matchIndex[id] < n.commitIndex {
+			return 0
+		}
+	}
+	idx := n.appendConfig(Membership{Voters: n.target, Old: n.conf.Voters})
+	n.target, n.learners = nil, nil
+	n.replicate()
+	return idx
 }
 
 func encodeConfig(c Membership) []byte {
@@ -111,7 +140,12 @@ func decodeConfig(b []byte) Membership {
 
 // peers lists every other node this one must talk to under its current config.
 func (n *Node) peers() []NodeID {
-	return slices.DeleteFunc(n.conf.members(), func(id NodeID) bool { return id == n.cfg.ID })
+	all := n.conf.members()
+	for id := range n.learners {
+		all = append(all, id)
+	}
+	slices.Sort(all)
+	return slices.DeleteFunc(all, func(id NodeID) bool { return id == n.cfg.ID })
 }
 
 // appendConfig appends a config entry to the leader's log and adopts it at once.

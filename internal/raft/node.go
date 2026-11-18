@@ -81,6 +81,11 @@ type Node struct {
 	commitIndex uint64
 	lastApplied uint64
 
+	// Leader only: a membership change waiting for its new servers to catch
+	// up. learners receive the log but are in no configuration yet.
+	target   []NodeID
+	learners map[NodeID]bool
+
 	// Leader only, reinitialized on election (Figure 2).
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
@@ -325,6 +330,7 @@ func (n *Node) becomeFollower(term uint64) {
 		n.persistState()
 	}
 	n.role, n.votes, n.preVoting, n.active = Follower, nil, false, nil
+	n.target, n.learners = nil, nil
 	if wasLeader {
 		n.leader = NoNode
 		n.failReads()
@@ -749,6 +755,7 @@ func (n *Node) handleAppendEntriesReply(from NodeID, r AppendEntriesReply) {
 		n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
 		n.replicating[from] = true
 		n.advanceCommit()
+		n.promote()
 		if n.nextIndex[from] <= n.lastIndex() {
 			n.sendAppend(from) // more to ship
 		}
@@ -867,6 +874,7 @@ func (n *Node) handleInstallSnapshotReply(from NodeID, r InstallSnapshotReply) {
 	n.matchIndex[from] = max(n.matchIndex[from], r.MatchIndex)
 	n.nextIndex[from] = max(n.nextIndex[from], n.matchIndex[from]+1)
 	n.advanceCommit()
+	n.promote()
 	if n.nextIndex[from] <= n.lastIndex() {
 		n.sendAppend(from)
 	}

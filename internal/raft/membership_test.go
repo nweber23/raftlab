@@ -183,9 +183,9 @@ func TestJointConsensusNeedsBothMajorities(t *testing.T) {
 	if _, err := c.Nodes[l].ChangeMembership(target); err != nil { // before the leader notices the split
 		c.Fatalf("%v", err)
 	}
-	idx := c.Nodes[l].Status().ConfigIndex
 	c.Run(100 * time.Millisecond) // long enough to replicate to 4 and 5, short of CheckQuorum
 	st := c.Nodes[l].Status()
+	idx := st.ConfigIndex // the learners caught up, so C(old,new) was appended
 	if st.Role != raft.Leader || st.LastIndex < idx {
 		c.Fatalf("setup went wrong: %+v", st.Role)
 	}
@@ -213,11 +213,17 @@ func TestMembershipErrors(t *testing.T) {
 		t.Fatalf("zero id: err=%v", err)
 	}
 	c.Run(time.Second)
-	c.AddNode(4)
-	if _, err := c.Nodes[l].ChangeMembership(ids{1, 2, 3, 4}); err != nil {
+	if _, err := c.Nodes[l].ChangeMembership(ids{1, 2, 3, 4}); err != nil { // 4 never starts: stays a learner
 		t.Fatal(err)
 	}
-	if _, err := c.Nodes[l].ChangeMembership(ids{1, 2}); err != raft.ErrConfigPending {
+	if st := c.Nodes[l].Status(); st.Config.Joint() || len(st.Config.Voters) != 3 {
+		t.Fatalf("learner phase changed the configuration: %+v", st.Config)
+	}
+	// While waiting for 4, a new request replaces the target and takes effect now.
+	if idx, err := c.Nodes[l].ChangeMembership(ids{1, 2}); err != nil || idx == 0 {
+		t.Fatalf("replacing a stuck change: idx=%d err=%v", idx, err)
+	}
+	if _, err := c.Nodes[l].ChangeMembership(ids{1, 2, 3}); err != raft.ErrConfigPending {
 		t.Fatalf("second change while one is running: err=%v", err)
 	}
 }
@@ -304,5 +310,36 @@ func membershipChurn(t *testing.T, seed uint64) {
 	}
 	if len(ref) == 0 {
 		c.Fatalf("nothing was ever committed")
+	}
+}
+
+// A newcomer that cannot be reached must not stall the cluster: it stays a
+// non-voting learner, so the old configuration keeps committing. If it joined
+// as a voter at once, replacing everyone with unreachable servers would freeze
+// the log (the new half could never form a majority).
+func TestUnreachableNewcomersDoNotStallCommits(t *testing.T) {
+	c := raftest.NewCluster(t, raftest.Options{Size: 3, Seed: 68})
+	l := c.WaitLeader()
+	c.Run(500 * time.Millisecond)
+	c.AddNode(4)
+	c.AddNode(5)
+	c.AddNode(6)
+	c.Net.Partition(ids{1, 2, 3}, ids{4, 5, 6})
+	if _, err := c.Nodes[l].ChangeMembership(ids{4, 5, 6}); err != nil {
+		t.Fatal(err)
+	}
+	want := cmds("a", 5)
+	for _, w := range want {
+		c.Propose(w)
+	}
+	if !c.RunUntil(3*time.Second, func() bool { return converged(c, ids{1, 2, 3}, want) }) {
+		c.Fatalf("commits stalled while the newcomers were unreachable")
+	}
+	if st := c.Nodes[l].Status(); st.Config.Joint() {
+		c.Fatalf("joint config adopted before the newcomers caught up")
+	}
+	c.Net.Heal()
+	if !c.RunUntil(10*time.Second, func() bool { return settled(c, ids{4, 5, 6}) }) {
+		c.Fatalf("change never completed after healing")
 	}
 }
