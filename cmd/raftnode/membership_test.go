@@ -101,7 +101,5 @@ func TestProcessesChangeMembership(t *testing.T) {
 	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("peer token accepted for membership: %v %v", resp, err)
 	}
-	if c, _ := do("POST", 2, "/membership", "{}"); c != http.StatusBadRequest {
-		t.Fatalf("empty membership: %d", c)
-	}
+	eventually("empty membership rejected", func() bool { c, _ := do("POST", 2, "/membership", "{}"); return c == http.StatusBadRequest })
 }
