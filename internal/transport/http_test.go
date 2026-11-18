@@ -141,3 +141,25 @@ func TestHandlerAuthAndAddressing(t *testing.T) {
 		t.Fatalf("delivered %d messages, want only the valid one", delivered)
 	}
 }
+
+func TestHTTPLearnsPeersAtRuntime(t *testing.T) {
+	got := make(chan raft.Message, 1)
+	h := transport.NewHTTP(nil, "")
+	defer h.Close()
+	srv := httptest.NewServer(transport.Handler(2, nil, "", func(m raft.Message) { got <- m }, transport.KnownPeers(h.Knows)))
+	defer srv.Close()
+	h.Send(raft.Message{From: 1, To: 2, Body: raft.AppendEntriesArgs{Term: 1}}) // unknown: dropped
+	if h.Knows(2) {
+		t.Fatal("peer known before SetPeers")
+	}
+	h.SetPeers(map[raft.NodeID]string{1: "http://unused", 2: srv.URL})
+	h.Send(raft.Message{From: 1, To: 2, Body: raft.AppendEntriesArgs{Term: 2}})
+	select {
+	case m := <-got:
+		if m.Term() != 2 {
+			t.Fatalf("got term %d, want 2 (first message must have been dropped)", m.Term())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("not delivered after SetPeers")
+	}
+}

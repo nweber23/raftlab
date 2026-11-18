@@ -19,6 +19,7 @@ const httpQueue = 256 // messages buffered per peer before new ones are dropped
 // queue and one worker, so a slow or dead peer cannot block the node and
 // messages to one peer stay in order. Raft tolerates the drops.
 type HTTP struct {
+	mu     sync.RWMutex           // guards peers and queues, which SetPeers grows
 	peers  map[raft.NodeID]string // base URLs, e.g. http://127.0.0.1:7001
 	queues map[raft.NodeID]chan raft.Message
 	client *http.Client
@@ -50,18 +51,42 @@ func NewHTTP(peers map[raft.NodeID]string, token string, opts ...HTTPOption) *HT
 	for _, o := range opts {
 		o(h)
 	}
-	for id := range peers {
-		q := make(chan raft.Message, httpQueue)
-		h.queues[id] = q
-		h.wg.Add(1)
-		go h.worker(id, q)
-	}
+	h.peers = map[raft.NodeID]string{}
+	h.SetPeers(peers)
 	return h
+}
+
+// SetPeers adds peers, or changes the URL of ones already known, from a map of
+// node to base URL. Peers are never removed: a server that has just left the
+// cluster must still be reachable to be told so, and an idle worker is cheap.
+func (h *HTTP) SetPeers(peers map[raft.NodeID]string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, url := range peers {
+		h.peers[id] = url
+		if _, ok := h.queues[id]; !ok {
+			q := make(chan raft.Message, httpQueue)
+			h.queues[id] = q
+			h.wg.Add(1)
+			go h.worker(id, q)
+		}
+	}
+}
+
+// Knows reports whether id is a peer.
+func (h *HTTP) Knows(id raft.NodeID) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	_, ok := h.peers[id]
+	return ok
 }
 
 // Send implements raft.Transport. It never blocks.
 func (h *HTTP) Send(m raft.Message) {
-	if q, ok := h.queues[m.To]; ok {
+	h.mu.RLock()
+	q, ok := h.queues[m.To]
+	h.mu.RUnlock()
+	if ok {
 		select {
 		case q <- m:
 		default: // queue full: drop
@@ -80,7 +105,10 @@ func (h *HTTP) worker(id raft.NodeID, q chan raft.Message) {
 			if err != nil {
 				continue
 			}
-			req, err := http.NewRequest(http.MethodPost, h.peers[id]+"/raft", bytes.NewReader(body))
+			h.mu.RLock()
+			url := h.peers[id]
+			h.mu.RUnlock()
+			req, err := http.NewRequest(http.MethodPost, url+"/raft", bytes.NewReader(body))
 			if err != nil {
 				continue
 			}
@@ -109,6 +137,14 @@ type HandlerOption func(*handlerConfig)
 
 type handlerConfig struct {
 	peerName func(raft.NodeID) string
+	known    func(raft.NodeID) bool
+}
+
+// KnownPeers makes Handler consult known, instead of its fixed peer list, to
+// decide whether a sender is a cluster member; pair it with HTTP.Knows when
+// membership changes at runtime.
+func KnownPeers(known func(raft.NodeID) bool) HandlerOption {
+	return func(c *handlerConfig) { c.known = known }
 }
 
 // RequirePeerCert makes Handler accept a message only over a TLS connection
@@ -131,9 +167,15 @@ func Handler(self raft.NodeID, peers []raft.NodeID, token string, deliver func(r
 	for _, o := range opts {
 		o(&cfg)
 	}
-	known := make(map[raft.NodeID]bool, len(peers))
+	static := make(map[raft.NodeID]bool, len(peers))
 	for _, p := range peers {
-		known[p] = p != self
+		static[p] = true
+	}
+	known := func(id raft.NodeID) bool {
+		if cfg.known != nil {
+			return id != self && cfg.known(id)
+		}
+		return id != self && static[id]
 	}
 	want := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +195,7 @@ func Handler(self raft.NodeID, peers []raft.NodeID, token string, deliver func(r
 		if err == nil {
 			var m raft.Message
 			if m, err = Decode(b); err == nil {
-				if m.To != self || !known[m.From] {
+				if m.To != self || !known(m.From) {
 					http.Error(w, "unknown sender or wrong recipient", http.StatusForbidden)
 					return
 				}
