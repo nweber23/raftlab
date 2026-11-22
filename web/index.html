@@ -3,55 +3,62 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>raftlab</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 16 16%27%3E%3Ccircle cx=%278%27 cy=%278%27 r=%276%27 fill=%27%23f4b942%27/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/fg-600.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header class="toolbar">
-  <div>
-    <h1>raftlab</h1>
-    <span class="sub">Live Raft cluster</span>
-    <span id="conn" class="pill off" role="status">Connecting…</span>
-  </div>
+<header class="top">
+  <h1 class="mark">raftlab</h1>
+  <dl class="readout" aria-label="Cluster summary">
+    <div><dt>Leader</dt><dd id="st-leader">–</dd></div>
+    <div><dt>Term</dt><dd id="st-term">–</dd></div>
+    <div><dt>Up</dt><dd id="st-nodes">–</dd></div>
+    <div><dt>Committed</dt><dd id="st-commit">–</dd></div>
+  </dl>
+  <span id="conn" class="pill off" role="status">Connecting…</span>
 </header>
 
 <main>
-  <section class="panel stage-panel" aria-label="Cluster">
-    <svg id="stage" viewBox="0 0 640 520" role="img" aria-label="Cluster topology with messages in flight">
-      <g id="links"></g>
-      <g id="msgs"></g>
-      <g id="nodes"></g>
-    </svg>
-    <ul class="legend" aria-label="Legend">
-      <li><i style="background:var(--vote)"></i>RequestVote</li>
-      <li><i style="background:var(--append)"></i>AppendEntries (data)</li>
-      <li><i style="background:var(--beat)"></i>heartbeat</li>
-      <li><i style="background:var(--ok)"></i>reply ok</li>
-      <li><i style="background:var(--no)"></i>reply refused / dropped</li>
-      <li><i style="background:var(--snap)"></i>InstallSnapshot</li>
-    </ul>
+  <section class="stage-wrap" aria-label="Cluster">
+    <div class="stage-frame" id="frame">
+      <svg id="stage" viewBox="0 0 640 520" role="img" aria-label="Cluster topology with messages in flight">
+        <g id="links"></g>
+        <g id="msgs"></g>
+        <g id="nodes"></g>
+      </svg>
+      <ul class="legend" aria-label="Legend">
+        <li><i style="--c:var(--vote)"></i>RequestVote</li>
+        <li><i style="--c:var(--append)"></i>AppendEntries</li>
+        <li><i style="--c:var(--beat)"></i>heartbeat</li>
+        <li><i style="--c:var(--ok)"></i>reply ok</li>
+        <li><i style="--c:var(--no)"></i>refused / dropped</li>
+        <li><i style="--c:var(--snap)"></i>InstallSnapshot</li>
+      </ul>
+    </div>
   </section>
 
   <aside class="side">
-    <section class="panel">
+    <section class="block">
       <h2>Nodes</h2>
-      <p class="hint">Select nodes to cut them off from the rest.</p>
-      <form id="resize" class="row">
-        <label for="n">Cluster size</label>
-        <input id="n" type="number" min="1" max="15" value="5" style="width:4.5em">
-        <button type="submit">Scale</button>
-      </form>
-      <p class="hint">Scaling adds or removes servers live (joint consensus); data and leadership are kept.</p>
       <ul id="nodelist" class="nodelist"></ul>
+      <p class="hint">Tick nodes to cut them off from the rest.</p>
       <div class="row">
-        <button id="btn-partition">Partition selected | rest</button>
+        <button id="btn-partition">Partition selected</button>
         <button id="btn-isolate-leader">Isolate leader</button>
         <button id="btn-heal">Heal</button>
       </div>
+      <form id="resize" class="row scale">
+        <label for="n">Cluster size</label>
+        <input id="n" type="number" min="1" max="15" value="5">
+        <button type="submit">Scale</button>
+      </form>
+      <p class="hint">Scaling adds or removes servers live by joint consensus. Data and leadership survive.</p>
     </section>
 
-    <section class="panel">
+    <section class="block">
       <h2>Network</h2>
       <label>Latency <output id="o-lat">0 ms</output>
         <input id="lat" type="range" min="0" max="500" step="10" value="0"></label>
@@ -63,11 +70,11 @@
         <input id="dup" type="range" min="0" max="50" step="1" value="0"></label>
     </section>
 
-    <section class="panel">
+    <section class="block">
       <h2>Key-value store</h2>
       <form id="kvform" class="kv">
-        <input id="key" placeholder="key" value="greeting" required aria-label="Key">
-        <input id="val" placeholder="value" value="hello" aria-label="Value">
+        <input id="key" placeholder="key" value="greeting" required aria-label="Key" autocomplete="off">
+        <input id="val" placeholder="value" value="hello" aria-label="Value" autocomplete="off">
         <select id="target" aria-label="Send to"><option value="auto">any node</option></select>
         <div class="row">
           <button type="submit" data-op="PUT">Set</button>
@@ -80,12 +87,12 @@
   </aside>
 </main>
 
-<section class="panel wide">
-  <h2>Replicated logs <span class="hint">Solid is committed, dashed is not yet committed, the green bar marks the commit index.</span></h2>
+<section class="wide">
+  <h2>Replicated logs <span class="hint">Solid is committed, dashed is not yet. The bar marks the commit index.</span></h2>
   <div id="logs"></div>
 </section>
 
-<section class="panel wide">
+<section class="wide">
   <h2>Events</h2>
   <ol id="events" class="events" aria-live="polite"></ol>
 </section>

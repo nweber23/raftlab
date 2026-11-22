@@ -45,13 +45,13 @@ function layout(nodes) {
   DENSE = n > 8;
   R = 190 + Math.max(0, n - 8) * 14;   // ring grows with the cluster so nodes never touch
   NODE_R = Math.min(44, 0.4 * 2 * R * Math.sin(Math.PI / Math.max(n, 2)));
-  const H = Math.max(520, 2 * (R + NODE_R + 45)), W = Math.max(640, H);
+  const H = Math.max(520, 2 * (R + NODE_R + 78)), W = Math.max(640, H);
   CX = W / 2; CY = H / 2;
   $("stage").setAttribute("viewBox", `0 0 ${W} ${H}`);
   $("stage").classList.toggle("dense", DENSE);
   for (const id of ["links", "nodes", "msgs", "nodelist", "logs"]) $(id).textContent = "";
   $("target").length = 1;
-  selected.clear(); flying.length = 0;
+  selected.clear(); flying.length = 0; seen.clear();
   for (const k of Object.keys(pos)) delete pos[k];
   for (const k of Object.keys(nodeEls)) delete nodeEls[k];
   nodes.forEach((n, i) => {
@@ -65,15 +65,17 @@ function layout(nodes) {
       el("line", { class: "link", id: `link-${nodes[i].id}-${nodes[j].id}`, x1: a.x, y1: a.y, x2: b.x, y2: b.y }, links);
     }
   }
-  for (const n of nodes) {
-    const g = el("g", { class: "node follower", transform: `translate(${pos[n.id].x} ${pos[n.id].y})` }, nl);
-    el("circle", { class: "body", r: NODE_R }, g);
+  nodes.forEach((n, idx) => {
+    const root = el("g", { class: "node follower", transform: `translate(${pos[n.id].x} ${pos[n.id].y})` }, nl);
+    const g = el("g", { class: "inner", style: `--i:${idx}` }, root);
+    const body = el("circle", { class: "body", r: NODE_R }, g);
+    el("circle", { class: "spin", r: NODE_R + 9 }, g);
     const crown = el("text", { class: "crown", y: -NODE_R - 6 }, g); crown.textContent = "Leader";
     const id = el("text", { class: "id", y: 7 }, g); id.textContent = "N" + n.id;
     const meta = el("text", { class: "meta", y: NODE_R + 16 }, g);
     const sub = el("text", { class: "meta", y: NODE_R + 30 }, g);
-    nodeEls[n.id] = { g, meta, sub };
-  }
+    nodeEls[n.id] = { g: root, body, meta, sub };
+  });
   const t = $("target");
   for (const n of nodes) t.add(new Option("node " + n.id, n.id));
 }
@@ -96,6 +98,12 @@ function renderStage(s) {
 
 // --- messages ---------------------------------------------------------------
 const flying = [];
+function hit(id) { // a node nudges when a packet lands, so you can see who is hearing what
+  const b = nodeEls[id] && nodeEls[id].body;
+  if (!b || b.classList.contains("hit")) return;
+  b.classList.add("hit"); setTimeout(() => b.classList.remove("hit"), 380);
+}
+
 function msgColor(m) {
   if (m.dropped) return "var(--no)";
   switch (m.kind) {
@@ -111,19 +119,26 @@ function onMsg(m) {
   const c = el("circle", { class: "msg", r: m.kind.startsWith("Append") && m.detail.includes("entries=0") ? 3 : DENSE ? 4 : 6, fill: msgColor(m) }, $("msgs"));
   const t = el("title", {}, c);
   t.textContent = `${m.kind} N${m.from}→N${m.to} (term ${m.term}) ${m.detail}` + (m.dropped ? ` — dropped: ${m.reason}` : "") + (m.dup ? " [duplicate]" : "");
-  flying.push({ m, c, start: performance.now(), dur: m.delayMs + MIN_FLIGHT_MS });
-  if (flying.length > 400) { const old = flying.shift(); old.c.remove(); }
+  const tr = DENSE ? null : el("line", { class: "trail", stroke: msgColor(m) }, $("msgs"));
+  flying.push({ m, c, tr, start: performance.now(), dur: m.delayMs + MIN_FLIGHT_MS });
+  if (flying.length > (DENSE ? 1200 : 400)) { const old = flying.shift(); old.c.remove(); if (old.tr) old.tr.remove(); }
 }
 function frame(now) {
   for (let i = flying.length - 1; i >= 0; i--) {
     const f = flying[i];
     let k = (now - f.start) / f.dur;
-    if (k >= 1) { f.c.remove(); flying.splice(i, 1); continue; }
+    if (k >= 1) { f.c.remove(); if (f.tr) f.tr.remove(); flying.splice(i, 1); if (!f.m.dropped) hit(f.m.to); continue; }
     const a = pos[f.m.from], b = pos[f.m.to];
     const stop = f.m.dropped ? 0.55 : 1;          // dropped packets die partway
     const kk = Math.min(k / stop, 1);
-    f.c.setAttribute("cx", a.x + (b.x - a.x) * kk * stop);
-    f.c.setAttribute("cy", a.y + (b.y - a.y) * kk * stop);
+    const x = a.x + (b.x - a.x) * kk * stop, y = a.y + (b.y - a.y) * kk * stop;
+    const k0 = Math.max(0, kk - 0.14) * stop;   // trail starts a little behind the head
+    f.c.setAttribute("cx", x); f.c.setAttribute("cy", y);
+    if (f.tr) {
+      f.tr.setAttribute("x1", a.x + (b.x - a.x) * k0); f.tr.setAttribute("y1", a.y + (b.y - a.y) * k0);
+      f.tr.setAttribute("x2", x); f.tr.setAttribute("y2", y);
+      f.tr.setAttribute("opacity", f.m.dropped && k > stop ? 0 : 1);
+    }
     f.c.setAttribute("opacity", f.m.dropped && k > stop ? Math.max(0, 1 - (k - stop) / (1 - stop)) : 1);
   }
   requestAnimationFrame(frame);
@@ -140,6 +155,8 @@ function cmdLabel(cmd) {
   } catch { return cmd.slice(0, 8); }
 }
 const MAX_CELLS = 28;
+const seen = new Map(); // node id -> Set of "index:term" already drawn, so only fresh entries animate
+let logsPrimed = false;
 function renderLogs(s) {
   const root = $("logs");
   if (!root.children.length) {
@@ -156,6 +173,8 @@ function renderLogs(s) {
     row.querySelector(".who").innerHTML = `<b>N${n.id}</b> ${n.up ? n.role : "crashed"}<small>term ${n.term} · applied ${n.applied}</small>`;
     const cells = row.querySelector(".cells");
     cells.textContent = "";
+    if (!seen.has(n.id)) seen.set(n.id, new Set());
+    const sn = seen.get(n.id);
     if (n.snapIndex > 0) cells.appendChild(cell(`snap ≤${n.snapIndex}`, "cell snap", "Compacted into a snapshot: entries up to this index are gone from the log"));
     const log = n.log.length > MAX_CELLS ? n.log.slice(-MAX_CELLS) : n.log;
     if (log.length < n.log.length) cells.appendChild(cell("…", "cell snap", `${n.log.length - log.length} older entries not shown`));
@@ -164,6 +183,9 @@ function renderLogs(s) {
     for (const e of log) {
       const c = cell(`${e.i}·${cmdLabel(e.cmd)}`, "cell" + (e.i > n.commit ? " pending" : ""),
         `index ${e.i}, term ${e.term}${e.i <= n.commit ? ", committed" : ", not committed"}\n${e.cmd || "leader no-op"}`);
+      const key = e.i + ":" + e.term;
+      if (logsPrimed && !sn.has(key)) c.classList.add("new");
+      sn.add(key);
       c.style.background = termColor(e.term); c.style.setProperty("--c", termColor(e.term));
       cells.appendChild(c);
       if (!marked && e.i === n.commit) { cells.appendChild(marker()); marked = true; }
@@ -171,6 +193,7 @@ function renderLogs(s) {
     if (!n.log.length && !n.snapIndex && n.up) cells.textContent = "(empty)";
     row.querySelector(".kvtext").textContent = n.up ? "kv " + JSON.stringify(n.kv) : "";
   }
+  logsPrimed = true;
 }
 function cell(text, cls, title) { const d = document.createElement("span"); d.className = cls; d.textContent = text; d.title = title; return d; }
 function marker() { const d = document.createElement("span"); d.className = "commit"; d.title = "commit index"; return d; }
@@ -218,11 +241,15 @@ $("btn-isolate-leader").onclick = () => {
 $("resize").onsubmit = (e) => { e.preventDefault(); post("/api/resize?n=" + $("n").value); };
 $("btn-heal").onclick = () => { post("/api/heal"); note("partitions healed"); };
 
+const ELECTION_MIN_MS = 150; // lab.go: election timeout is 150-300 ms, so slower links can never elect a leader
+let slowWarned = false;
 let netTimer;
 function netInputs() {
   const lat = +$("lat").value, jit = +$("jit").value, drop = +$("drop").value, dup = +$("dup").value;
   $("o-lat").textContent = lat + " ms"; $("o-jit").textContent = jit + " ms";
   $("o-drop").textContent = drop + " %"; $("o-dup").textContent = dup + " %";
+  if (lat >= ELECTION_MIN_MS && !slowWarned) note(`latency ${lat} ms is above the ${ELECTION_MIN_MS} ms election timeout: votes arrive too late, so expect endless elections and no leader`);
+  slowWarned = lat >= ELECTION_MIN_MS;
   clearTimeout(netTimer);
   netTimer = setTimeout(() => post("/api/network", { minDelayMs: lat, maxDelayMs: lat + jit, dropRate: drop / 100, dupRate: dup / 100 }), 120);
 }
@@ -280,16 +307,32 @@ function diffEvents(a, b) {
   }
 }
 
+// --- summary readout ----------------------------------------------------------
+function setStat(id, text) {
+  const e = $(id);
+  if (e.textContent === text) return;
+  e.textContent = text;
+  e.classList.remove("tick"); void e.offsetWidth; e.classList.add("tick");
+}
+function renderReadout(s) {
+  const up = s.nodes.filter((n) => n.up);
+  const lead = up.filter((n) => n.role === "leader").sort((a, b) => b.term - a.term)[0];
+  setStat("st-leader", lead ? "N" + lead.id : "none");
+  setStat("st-term", String(Math.max(0, ...s.nodes.map((n) => n.term))));
+  setStat("st-nodes", `${up.length}/${s.nodes.length}`);
+  setStat("st-commit", String(Math.max(0, ...s.nodes.map((n) => n.commit))));
+}
+
 // --- state ------------------------------------------------------------------
 function onState(s) {
   if (!state) { syncNet(s); note("connected"); }
   if (!state || state.nodes.length !== s.nodes.length) {
     if (state) note(`cluster scaled to ${s.nodes.length} nodes`);
-    layout(s.nodes); state = null; $("n").value = s.nodes.length;
+    layout(s.nodes); state = null; logsPrimed = false; $("n").value = s.nodes.length;
   }
   diffEvents(state, s);
   prev = state; state = s;
-  renderStage(s); renderNodeList(s); renderLogs(s);
+  renderStage(s); renderNodeList(s); renderLogs(s); renderReadout(s);
 }
 
 connect();
